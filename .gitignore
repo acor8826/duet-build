@@ -1,0 +1,11 @@
+# Secrets / local env
+server/.env
+.env
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Local duet session state
+.claude/duet/
