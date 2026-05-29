@@ -42,6 +42,38 @@ function Require-Gcloud {
     }
 }
 
+# gcloud writes routine progress to stderr. Under this script's
+# $ErrorActionPreference='Stop' (PowerShell 5.1) those writes surface as
+# terminating NativeCommandError exceptions and abort an otherwise-successful
+# deploy. These helpers merge stderr back into the output stream (so it stays
+# visible) and gate on the real success signal -- $LASTEXITCODE -- instead.
+function Invoke-Gcloud {
+    [CmdletBinding()]
+    param([Parameter(Mandatory, ValueFromRemainingArguments)][string[]]$GcloudArgs)
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = 0
+    & gcloud @GcloudArgs 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { [Console]::Error.WriteLine($_.ToString()) }
+        else { $_ }
+    }
+    if ($LASTEXITCODE -ne 0) { throw "gcloud $($GcloudArgs -join ' ') failed with exit $LASTEXITCODE" }
+}
+
+function Invoke-GcloudPiped {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InputText,
+        [Parameter(Mandatory, ValueFromRemainingArguments)][string[]]$GcloudArgs
+    )
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = 0
+    $InputText | & gcloud @GcloudArgs 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { [Console]::Error.WriteLine($_.ToString()) }
+        else { $_ }
+    }
+    if ($LASTEXITCODE -ne 0) { throw "gcloud $($GcloudArgs -join ' ') failed with exit $LASTEXITCODE" }
+}
+
 Require-Gcloud
 
 if (-not $Project) {
@@ -55,7 +87,7 @@ if (-not $Project) { throw 'No GCP project id provided.' }
 Write-Output "project=$Project region=$Region service=$ServiceName partner_model=$PartnerModel"
 
 Write-Output 'Enabling required APIs...'
-& gcloud services enable run.googleapis.com secretmanager.googleapis.com cloudbuild.googleapis.com --project $Project
+Invoke-Gcloud services enable run.googleapis.com secretmanager.googleapis.com cloudbuild.googleapis.com --project $Project
 
 # Ensure Secret Manager secret exists.
 $secretName = 'duet-openai-key'
@@ -66,7 +98,7 @@ if ($LASTEXITCODE -ne 0) {
     $apiKeyPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
     [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
     Write-Output 'Creating secret duet-openai-key...'
-    $apiKeyPlain | & gcloud secrets create $secretName --data-file=- --replication-policy=automatic --project $Project
+    Invoke-GcloudPiped -InputText $apiKeyPlain secrets create $secretName --data-file=- --replication-policy=automatic --project $Project
 } else {
     Write-Output "Secret $secretName already exists; using latest version."
 }
@@ -79,7 +111,7 @@ if ($LASTEXITCODE -ne 0) {
     $bytes = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $bearerPlain = [Convert]::ToBase64String($bytes)
-    $bearerPlain | & gcloud secrets create $bearerSecretName --data-file=- --replication-policy=automatic --project $Project
+    Invoke-GcloudPiped -InputText $bearerPlain secrets create $bearerSecretName --data-file=- --replication-policy=automatic --project $Project
     Write-Output ''
     Write-Output '=== COPY THIS BEARER TOKEN (you will paste it into claude.ai) ==='
     Write-Output $bearerPlain
@@ -93,7 +125,8 @@ if ($LASTEXITCODE -ne 0) {
 $srcDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 Write-Output 'Deploying to Cloud Run...'
-& gcloud run deploy $ServiceName `
+# Invoke-Gcloud already throws on a non-zero exit, so no separate check is needed.
+Invoke-Gcloud run deploy $ServiceName `
     --source $srcDir `
     --region $Region `
     --project $Project `
@@ -106,12 +139,8 @@ Write-Output 'Deploying to Cloud Run...'
     --max-instances 3 `
     --timeout 900
 
-if ($LASTEXITCODE -ne 0) {
-    throw "gcloud run deploy failed with exit $LASTEXITCODE"
-}
-
 Write-Output 'Fetching service URL...'
-$url = & gcloud run services describe $ServiceName --region $Region --project $Project --format 'value(status.url)'
+$url = Invoke-Gcloud run services describe $ServiceName --region $Region --project $Project --format 'value(status.url)'
 Write-Output "DUET_BRIDGE_URL=$url"
 Write-Output ''
 Write-Output 'Done. Set DUET_BRIDGE_URL in your local .env to point Claude Code at this service.'
