@@ -69,6 +69,50 @@ class StateRoundTrip(unittest.TestCase):
             self.assertEqual(got.pending_tool_args["name"], "austlii-legal-research")
 
 
+class DocumentFieldsState(unittest.TestCase):
+    def test_document_fields_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = SessionStore(td)
+            s = Session(
+                session_id="sess-doc",
+                role="critic",
+                spec="s",
+                documents=[{"name": "a.txt", "content": "BODY", "source": "vault"}],
+                available_documents=[{"name": "b.pdf", "description": "big"}],
+                doc_requests_made=3,
+            )
+            store.put(s)
+            store._cache.clear()  # force disk read
+            got = store.get("sess-doc")
+            assert got is not None
+            self.assertEqual(got.documents[0]["content"], "BODY")
+            self.assertEqual(got.available_documents[0]["name"], "b.pdf")
+            self.assertEqual(got.doc_requests_made, 3)
+
+    def test_legacy_session_json_loads_with_defaults(self) -> None:
+        # A session file written before the document fields existed must still load.
+        with tempfile.TemporaryDirectory() as td:
+            store = SessionStore(td)
+            legacy = {
+                "session_id": "sess-old",
+                "role": "critic",
+                "spec": "s",
+                "history": [{"role": "system", "content": "x"}],
+                "pending_tool_use_id": None,
+                "pending_tool_name": None,
+                "pending_tool_args": None,
+                "last_final": None,
+                "closed": False,
+            }
+            Path(td, "sessions", "sess-old.json").write_text(
+                json.dumps(legacy), encoding="utf-8")
+            got = store.get("sess-old")
+            assert got is not None
+            self.assertEqual(got.documents, [])
+            self.assertEqual(got.available_documents, [])
+            self.assertEqual(got.doc_requests_made, 0)
+
+
 class ConvergenceTests(unittest.TestCase):
     def _score(self, v: int) -> Score:
         return Score(value=v, rationale="ok")

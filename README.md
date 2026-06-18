@@ -1,7 +1,7 @@
-# duet — Opus 4.7 ↔ GPT-5.5 consensus collaboration
+# duet — Opus 4.8 ↔ GPT-5.5 consensus collaboration
 
 `duet` is a Claude Code skill plus a Python FastMCP server that drives two-model
-consensus on a deliverable. Claude Opus 4.7 and OpenAI GPT-5.5 take turns
+consensus on a deliverable. Claude Opus 4.8 and OpenAI GPT-5.5 take turns
 drafting, critiquing, scoring, and counter-drafting against a shared rubric
 until **both** score the same candidate ≥ 95/100 with **zero** open critique
 items. An independent verifier subagent then signs off, and the user accepts
@@ -25,7 +25,7 @@ at gate G3.
 flowchart TB
     user["User: /duet &lt;task&gt;"] -->|enqueue| prd[("duet-prd.json")]
     prd -->|pop| outer["outer-loop.ps1"]
-    outer -->|claude -p /duet:run| skill["duet skill (Opus 4.7)"]
+    outer -->|claude -p /duet:run| skill["duet skill (Opus 4.8)"]
     skill -->|state machine| sm{{"inner_loop.py"}}
     sm -->|G1 ok| draft["DRAFTING"]
     draft --> roster["ROSTER_PROPOSAL"]
@@ -253,6 +253,8 @@ connector — no need to remove and re-add).
 | `OPENAI_PARTNER_MODEL`      | `gpt-5.5`                                    | Model id passed to chat.completions.                     |
 | `DUET_ITERATION_CAP`        | `8`                                          | Max inner-loop iterations before ESCALATED.              |
 | `DUET_CONFIDENCE_THRESHOLD` | `95`                                         | Min score (both models) required to converge.            |
+| `DUET_MAX_DOC_CHARS`        | `100000`                                     | Per-document content cap (push + pull); longer text is truncated and marked. |
+| `DUET_MAX_DOC_REQUESTS`     | `4`                                          | Max `request_document` pulls GPT may make per turn before the bridge forces a final. |
 | `DUET_TRANSPORT`            | `stdio`                                      | `stdio` (local MCP) or `http` (Cloud Run).               |
 | `DUET_STATE_DIR`            | `C:\Users\acor8\.claude\duet` / `/tmp/duet-state` | Session + lock directory.                          |
 | `PORT`                      | `8080`                                       | HTTP port (Cloud Run only).                              |
@@ -303,6 +305,51 @@ Cap behaviour: if the 8-iteration cap is reached without acceptance, the
 job is `ESCALATED` for user adjudication (this only happens when scores
 never stabilised or a real blocker/major/moderate is open — both cases
 the user needs to see).
+
+## Document exchange (v0.3)
+
+By default duet only passes text (the `spec` and `candidate`). To let GPT ground
+its advice in the **actual documents** a task is about — and, in co-work, to let GPT
+**request** a document that lives in a vault or file — duet adds a two-way exchange
+that rides the existing suspend/resume tool channel. The Cloud Run bridge never
+touches the filesystem; all file/vault resolution stays on the Claude orchestrator
+side (Claude Code / cowork / web), which is the only party with that access.
+
+**Push (Claude → GPT).** `duet_gpt_start_turn` takes two optional params:
+
+| Param                 | Shape                                             | Effect                                                                 |
+|-----------------------|---------------------------------------------------|------------------------------------------------------------------------|
+| `documents`           | `[{name, content, mime?, source?}]`               | Full text is rendered into GPT's first message as delimited `=== DOCUMENT: name ===` blocks (capped at `DUET_MAX_DOC_CHARS`). |
+| `available_documents` | `[{name, description?, source?}]`                 | A catalog advertised to GPT; it can fetch any entry's full text on demand via `request_document`. |
+
+**Pull (GPT → Claude, multi-step).** GPT can emit a `request_document` tool call
+`{name, query?, source_hint?}`. The bridge suspends exactly as it does for
+`claude_slash_command` and returns `{status:"tool_request", payload:{tool_name:"request_document",
+tool_args, tool_use_id}}`. The orchestrator resolves the document (co-work vault /
+project files / upload, extracting text from binary formats) and resumes:
+
+```
+duet_gpt_resume_turn(session_id, tool_use_id, tool_result)
+# tool_result is a JSON string:
+{"found": true, "name": "contract.pdf", "content": "...", "mime": "text/plain", "truncated": false}
+# or, if it can't be located:
+{"found": false, "reason": "not in vault", "available": ["a.docx", "b.pdf"]}
+```
+
+GPT may pull **several documents in succession** before delivering its critique. This
+is what makes the exchange genuinely multi-step: the per-turn `request_document` budget
+is `DUET_MAX_DOC_REQUESTS` (default 4), after which the bridge forces GPT to produce a
+final WorkProduct. (While the budget remains, the bridge leaves `response_format`
+unconstrained so a *second* tool call is possible — forcing `json_object` on every call
+suppresses follow-up tool calls and would break the multi-step pull.)
+
+**`duet_run` is push-only.** The headless one-call path accepts `documents` (given to
+both models) but has no orchestrator, so GPT cannot pull more documents there; its
+result `limitations` say so. Use the `duet_gpt_start_turn`/`resume` bridge path for the
+interactive, multi-step pull (e.g. a co-work vault).
+
+**Privacy.** Document content is sent cross-vendor to GPT/OpenAI. The orchestrator
+instructions surface this as a one-line note and otherwise send freely.
 
 ## Worked-example runbook (step 10 of the build plan)
 

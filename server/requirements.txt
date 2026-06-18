@@ -1,4 +1,5 @@
 fastmcp>=0.4.0
 openai>=1.40.0
+anthropic>=0.40.0
 pydantic>=2.6.0
 python-dotenv>=1.0.0

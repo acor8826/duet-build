@@ -25,6 +25,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from state import Session, SessionStore  # noqa: E402
 from rubric import WorkProduct  # noqa: E402
 from prompts.system_prompts import PROMPTS  # noqa: E402
+from jsonutil import _json_obj  # noqa: E402  (tolerant final-WorkProduct parsing)
+import duet_run as duet_run_mod  # noqa: E402  (aliased: the MCP tool below is named duet_run)
 
 load_dotenv()
 
@@ -39,6 +41,10 @@ STATE_DIR = os.environ.get("DUET_STATE_DIR", str(Path.home() / ".claude" / "duet
 TRANSPORT = os.environ.get("DUET_TRANSPORT", "stdio")
 PORT = int(os.environ.get("PORT", "8080"))
 BEARER = os.environ.get("DUET_MCP_BEARER")
+
+# Document-exchange limits.
+DUET_MAX_DOC_CHARS = int(os.environ.get("DUET_MAX_DOC_CHARS", "100000"))  # per-document content cap
+DUET_MAX_DOC_REQUESTS = int(os.environ.get("DUET_MAX_DOC_REQUESTS", "4"))  # request_document budget per turn
 
 _STORE = SessionStore(STATE_DIR)
 
@@ -67,10 +73,89 @@ CLAUDE_SLASH_TOOL = {
 }
 
 
-def _build_user_message(spec: str, candidate: Optional[str], history_note: str = "") -> str:
+# The second tool: GPT asks the orchestrator to send it the actual text of a document.
+# The bridge has no filesystem/vault access — it only relays the request via the same
+# suspend/resume channel as claude_slash_command; the Claude orchestrator on the surface
+# (Claude Code / cowork / web) resolves it (e.g. from a co-work vault) and resumes.
+REQUEST_DOCUMENT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "request_document",
+        "description": (
+            "Request the actual full text of a document so you can ground your critique in "
+            "the real source instead of guessing. The Claude orchestrator will fetch it "
+            "(for example from the co-work vault, the project files, or an upload) and return "
+            "its text. Use this whenever your advice depends on a document's real contents — "
+            "especially for documents named in the spec or listed under AVAILABLE DOCUMENTS. "
+            "You may request several documents in turn before giving your final answer. The "
+            "result is a JSON object: {\"found\":true,\"name\":..,\"content\":..,\"truncated\":..} "
+            "or {\"found\":false,\"reason\":..,\"available\":[..]} if it could not be located."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Document name/identifier/path to fetch (e.g. from the AVAILABLE DOCUMENTS catalog)."},
+                "query": {"type": "string", "description": "What you are looking for in it / why you need it."},
+                "source_hint": {"type": "string", "description": "Optional hint on where to look, e.g. 'cowork_vault', 'project_files', 'any'."},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def _truncate_doc(content: str) -> tuple[str, bool]:
+    """Cap a document body at DUET_MAX_DOC_CHARS; return (text, was_truncated)."""
+    content = "" if content is None else str(content)
+    if len(content) > DUET_MAX_DOC_CHARS:
+        return content[:DUET_MAX_DOC_CHARS], True
+    return content, False
+
+
+def _render_document_block(doc: Dict[str, Any]) -> str:
+    """Render one pushed document as a clearly delimited block GPT can quote/pin-cite."""
+    name = doc.get("name") or doc.get("id") or "document"
+    source = doc.get("source")
+    content, truncated = _truncate_doc(doc.get("content", ""))
+    truncated = truncated or bool(doc.get("truncated"))
+    header = f"=== DOCUMENT: {name}"
+    if source:
+        header += f" [{source}]"
+    if truncated:
+        header += " (truncated)"
+    header += " ==="
+    return f"{header}\n{content}\n=== END DOCUMENT: {name} ==="
+
+
+def _build_user_message(
+    spec: str,
+    candidate: Optional[str],
+    history_note: str = "",
+    documents: Optional[List[Dict[str, Any]]] = None,
+    available_documents: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     parts = ["SPEC:", spec, ""]
     if candidate:
         parts += ["CURRENT CANDIDATE FROM OPUS:", candidate, ""]
+    if documents:
+        parts.append("ATTACHED DOCUMENTS (use their actual contents in your analysis):")
+        for d in documents:
+            parts += [_render_document_block(d), ""]
+    if available_documents:
+        parts += [
+            "AVAILABLE DOCUMENTS — you do not have these yet, but you can fetch the full",
+            "text of any of them by calling the request_document tool with its name:",
+        ]
+        for d in available_documents:
+            name = d.get("name") or d.get("id") or "document"
+            line = f"- {name}"
+            if d.get("source"):
+                line += f" [{d['source']}]"
+            if d.get("description"):
+                line += f": {d['description']}"
+            parts.append(line)
+        parts.append("")
     if history_note:
         parts += ["NOTE:", history_note, ""]
     parts += [
@@ -85,38 +170,68 @@ def _build_user_message(spec: str, candidate: Optional[str], history_note: str =
 
 
 def _run_openai_loop(session: Session) -> Dict[str, Any]:
-    """Run the OpenAI chat loop until either GPT emits a tool_call (suspend) or returns a final."""
+    """Run the OpenAI chat loop until GPT emits a tool_call (suspend) or returns a final.
+
+    GPT may call either tool — `claude_slash_command` or `request_document`. While the
+    per-turn document-request budget remains, the tools are offered with `response_format`
+    left UNCONSTRAINED, so GPT can make a *second* tool call after seeing the first result;
+    that is what makes the document pull genuinely multi-step (forcing `json_object` on
+    every call, as the old gating effectively did, suppresses the second tool call). Once
+    the budget is exhausted we force closure with `tool_choice="none"` + `json_object` so
+    GPT must emit a final WorkProduct. The final content is parsed tolerantly because an
+    unconstrained response may arrive fenced or prose-wrapped.
+    """
     client = _openai_client()
     while True:
+        if session.doc_requests_made < DUET_MAX_DOC_REQUESTS:
+            call_kwargs: Dict[str, Any] = {
+                "tools": [CLAUDE_SLASH_TOOL, REQUEST_DOCUMENT_TOOL],
+                "tool_choice": "auto",
+                "parallel_tool_calls": False,  # serialise tool calls one at a time
+            }
+        else:
+            # Document-request budget exhausted — force a final WorkProduct.
+            call_kwargs = {
+                "tools": [CLAUDE_SLASH_TOOL, REQUEST_DOCUMENT_TOOL],
+                "tool_choice": "none",
+                "response_format": {"type": "json_object"},
+            }
         resp = client.chat.completions.create(
             model=MODEL,
             messages=session.history,
-            tools=[CLAUDE_SLASH_TOOL],
-            tool_choice="auto",
-            response_format={"type": "json_object"} if not _has_open_tool_call(session) else None,
+            **call_kwargs,
         )
         choice = resp.choices[0]
         msg = choice.message
 
-        # Persist the assistant message in history.
-        asst_entry: Dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
         if msg.tool_calls:
-            asst_entry["tool_calls"] = [
-                {
+            tc = msg.tool_calls[0]  # serialise tool calls one at a time
+            # Persist ONLY the served tool call so history stays valid (a single tool
+            # result answers it); any extra parallel calls are dropped and GPT can
+            # re-request next round.
+            if len(msg.tool_calls) > 1:
+                dropped = [t.function.name for t in msg.tool_calls[1:]]
+                print(
+                    f"[duet-bridge] session={session.session_id}: serving "
+                    f"{tc.function.name!r}, dropped {len(dropped)} parallel tool call(s) "
+                    f"{dropped} (GPT may re-request next round)",
+                    file=sys.stderr,
+                )
+            session.history.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [{
                     "id": tc.id,
                     "type": "function",
                     "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                }
-                for tc in msg.tool_calls
-            ]
-        session.history.append(asst_entry)
-
-        if msg.tool_calls:
-            tc = msg.tool_calls[0]  # serialise tool calls one at a time
+                }],
+            })
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {"_raw": tc.function.arguments}
+            if tc.function.name == "request_document":
+                session.doc_requests_made += 1
             session.pending_tool_use_id = tc.id
             session.pending_tool_name = tc.function.name
             session.pending_tool_args = args
@@ -130,10 +245,10 @@ def _run_openai_loop(session: Session) -> Dict[str, Any]:
                 },
             }
 
-        # No tool call → final.
-        try:
-            wp_dict = json.loads(msg.content or "{}")
-        except json.JSONDecodeError:
+        # No tool call → final. Persist the assistant message and parse tolerantly.
+        session.history.append({"role": "assistant", "content": msg.content or ""})
+        wp_dict = _json_obj(msg.content or "")
+        if not wp_dict:
             wp_dict = {"role": session.role, "candidate_id": "unknown",
                        "notes": msg.content or "", "critique_items": []}
         # Validate via pydantic (best-effort).
@@ -148,13 +263,6 @@ def _run_openai_loop(session: Session) -> Dict[str, Any]:
         session.pending_tool_args = None
         _STORE.put(session)
         return {"status": "final", "payload": payload}
-
-
-def _has_open_tool_call(session: Session) -> bool:
-    if not session.history:
-        return False
-    last = session.history[-1]
-    return bool(last.get("tool_calls"))
 
 
 # ---------------------- MCP tool surface ----------------------
@@ -173,6 +281,8 @@ def _start_turn_impl(
     spec: str,
     candidate: Optional[str],
     history_note: str,
+    documents: Optional[List[Dict[str, Any]]] = None,
+    available_documents: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     if role not in PROMPTS:
         return {"status": "error", "payload": {
@@ -185,10 +295,18 @@ def _start_turn_impl(
         # Reuse — caller may want to continue. But typical pattern: start = fresh.
         session = existing
     else:
-        session = Session(session_id=sid, role=role, spec=spec, history=[
-            {"role": "system", "content": PROMPTS[role]},
-            {"role": "user", "content": _build_user_message(spec, candidate, history_note)},
-        ])
+        session = Session(
+            session_id=sid,
+            role=role,
+            spec=spec,
+            documents=list(documents or []),
+            available_documents=list(available_documents or []),
+            history=[
+                {"role": "system", "content": PROMPTS[role]},
+                {"role": "user", "content": _build_user_message(
+                    spec, candidate, history_note, documents, available_documents)},
+            ],
+        )
         _STORE.put(session)
     result = _run_openai_loop(session)
     result["session_id"] = sid
@@ -210,8 +328,18 @@ def _resume_turn_impl(
                 "got": tool_use_id,
             },
         }
+    # For request_document, GPT's prompt expects a JSON object ({found, content, ...}).
+    # If the orchestrator passed a non-JSON string, wrap it so GPT receives a well-formed
+    # result rather than a raw blob. Slash-command results are passed through untouched.
+    content = tool_result
+    if session.pending_tool_name == "request_document":
+        try:
+            if not isinstance(json.loads(tool_result), dict):
+                raise ValueError
+        except (ValueError, TypeError):
+            content = json.dumps({"found": True, "content": tool_result})
     session.history.append(
-        {"role": "tool", "tool_call_id": tool_use_id, "content": tool_result}
+        {"role": "tool", "tool_call_id": tool_use_id, "content": content}
     )
     session.pending_tool_use_id = None
     session.pending_tool_name = None
@@ -231,7 +359,14 @@ def _close_session_impl(session_id: str) -> Dict[str, Any]:
 
 
 def _health_impl() -> Dict[str, Any]:
-    return {"ok": True, "model": MODEL, "transport": TRANSPORT, "state_dir": STATE_DIR}
+    return {
+        "ok": True,
+        "model": MODEL,
+        "transport": TRANSPORT,
+        "state_dir": STATE_DIR,
+        "opus_model": duet_run_mod.OPUS_MODEL,
+        "duet_run_available": duet_run_mod.opus_available(),
+    }
 
 
 if mcp is not None:
@@ -243,9 +378,24 @@ if mcp is not None:
         candidate: Optional[str] = None,
         history_note: str = "",
         session_id: Optional[str] = None,
+        documents: Optional[List[Dict[str, Any]]] = None,
+        available_documents: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """Start a GPT turn. Returns either {status:'tool_request', ...} or {status:'final', ...}."""
-        return _start_turn_impl(session_id, role, spec, candidate, history_note)
+        """Start a GPT turn. Returns either {status:'tool_request', ...} or {status:'final', ...}.
+
+        Document exchange (optional):
+          * documents: list of {name, content, mime?, source?} whose FULL TEXT is sent to
+            GPT in this turn — so its critique is grounded in the real source, not a
+            paraphrase. Per-document content is capped at DUET_MAX_DOC_CHARS.
+          * available_documents: list of {name, description?, source?} advertised as a
+            catalog GPT can pull from on demand by calling the request_document tool. GPT's
+            pull comes back as status:'tool_request' with tool_name='request_document'; the
+            orchestrator resolves it (e.g. from a co-work vault) and replies via
+            duet_gpt_resume_turn. GPT may pull several documents in succession before its
+            final answer (a two-way, multi-step exchange).
+        """
+        return _start_turn_impl(
+            session_id, role, spec, candidate, history_note, documents, available_documents)
 
     @mcp.tool()
     def duet_gpt_resume_turn(
@@ -263,6 +413,39 @@ if mcp is not None:
     def duet_health() -> Dict[str, Any]:
         """Health probe — returns model + transport configuration."""
         return _health_impl()
+
+    @mcp.tool()
+    def duet_run(
+        spec: str,
+        threshold: Optional[int] = None,
+        iteration_cap: Optional[int] = None,
+        documents: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Run the FULL two-model consensus loop server-side and return the final artifact.
+
+        One call does the whole thing: Claude Opus 4.8 drafts, GPT-5.5 critiques and
+        scores, Opus revises, repeating until both models accept the same candidate
+        (rubric.acceptance_check) or the iteration cap is hit, then an independent
+        verifier (fresh context) signs off. Designed so any surface that can reach this
+        connector (web/desktop/mobile chat, cowork) gets duet without a local
+        orchestrator.
+
+        Args:
+            spec: The task / deliverable specification (required).
+            threshold: Acceptance score 0-100 (default 95).
+            iteration_cap: Max critique/revise rounds (default 8).
+            documents: Optional list of {name, content, source?} whose full text is given
+                to both models so the work is grounded in the real source. Server-side
+                duet_run is PUSH-ONLY for documents — there is no orchestrator here, so GPT
+                cannot pull additional documents (use the duet_gpt_start_turn / resume
+                bridge path for the interactive, multi-step pull, e.g. from a co-work vault).
+
+        Returns a dict with accepted, gate, final_candidate, scores, verifier,
+        suggested_improvements, and a step transcript. Requires ANTHROPIC_API_KEY to be
+        configured on the bridge for the Opus role; returns status:'error' otherwise.
+        """
+        return duet_run_mod.run_duet(
+            spec, threshold=threshold, iteration_cap=iteration_cap, documents=documents)
 
 
 def _build_http_app():

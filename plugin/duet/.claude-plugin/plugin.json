@@ -1,0 +1,7 @@
+{
+  "name": "duet",
+  "description": "Two-model consensus collaboration between Claude Opus 4.8 and OpenAI GPT-5.5 via the duet-bridge connector. Provides the /duet slash command (resolves through the command resolver, sidestepping the personal-skill 'Unknown skill' bug) plus an auto-triggering skill for natural-language invocation.",
+  "author": {
+    "name": "acor8826"
+  }
+}

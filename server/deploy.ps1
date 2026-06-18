@@ -122,6 +122,46 @@ if ($LASTEXITCODE -ne 0) {
     Write-Output "  gcloud secrets versions access latest --secret=$bearerSecretName --project=$Project"
 }
 
+# Anthropic key (Opus role for the server-side duet_run tool). Optional: if the
+# secret is absent we deploy without it and duet_run reports itself unavailable
+# until the secret is added and the service is redeployed. Create it with:
+#   echo -n "<your-anthropic-key>" | gcloud secrets create duet-anthropic-key \
+#       --data-file=- --replication-policy=automatic --project=<project>
+$anthropicSecretName = 'duet-anthropic-key'
+# Probe for the secret without letting gcloud's NOT_FOUND stderr abort the script
+# under $ErrorActionPreference='Stop' (PowerShell 5.1 wraps native stderr as a
+# terminating NativeCommandError). Continue + swallow, gate on $LASTEXITCODE.
+$anthropicExists = $false
+try {
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = 0
+    & gcloud secrets describe $anthropicSecretName --project $Project 2>&1 | Out-Null
+    $anthropicExists = ($LASTEXITCODE -eq 0)
+} catch {
+    $anthropicExists = $false
+} finally {
+    $ErrorActionPreference = 'Stop'
+}
+$secretMap = "OPENAI_API_KEY=$($secretName):latest,DUET_MCP_BEARER=$($bearerSecretName):latest"
+if ($anthropicExists) {
+    Write-Output "Secret $anthropicSecretName found; enabling server-side duet_run (Opus role)."
+    $secretMap += ",ANTHROPIC_API_KEY=$($anthropicSecretName):latest"
+    # Ensure the Cloud Run runtime service account can read the secret (idempotent).
+    $projNum = (& gcloud projects describe $Project --format 'value(projectNumber)' 2>$null)
+    if ($projNum) {
+        $runtimeSa = "$projNum-compute@developer.gserviceaccount.com"
+        Write-Output "Ensuring $runtimeSa can access $anthropicSecretName..."
+        Invoke-Gcloud secrets add-iam-policy-binding $anthropicSecretName `
+            --member "serviceAccount:$runtimeSa" `
+            --role roles/secretmanager.secretAccessor `
+            --project $Project | Out-Null
+    }
+} else {
+    Write-Output "Secret $anthropicSecretName NOT found; deploying without it (duet_run will report unavailable)."
+    Write-Output "  Add it later, then re-run this script:"
+    Write-Output "  echo -n '<key>' | gcloud secrets create $anthropicSecretName --data-file=- --replication-policy=automatic --project=$Project"
+}
+
 $srcDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 Write-Output 'Deploying to Cloud Run...'
@@ -131,8 +171,8 @@ Invoke-Gcloud run deploy $ServiceName `
     --region $Region `
     --project $Project `
     --allow-unauthenticated `
-    --set-env-vars "OPENAI_PARTNER_MODEL=$PartnerModel,DUET_TRANSPORT=http,DUET_STATE_DIR=/tmp/duet-state,DUET_ITERATION_CAP=8,DUET_CONFIDENCE_THRESHOLD=95" `
-    --set-secrets "OPENAI_API_KEY=$($secretName):latest,DUET_MCP_BEARER=$($bearerSecretName):latest" `
+    --set-env-vars "OPENAI_PARTNER_MODEL=$PartnerModel,DUET_TRANSPORT=http,DUET_STATE_DIR=/tmp/duet-state,DUET_ITERATION_CAP=8,DUET_CONFIDENCE_THRESHOLD=95,DUET_OPUS_MODEL=claude-opus-4-8" `
+    --set-secrets $secretMap `
     --memory 512Mi `
     --cpu 1 `
     --concurrency 4 `

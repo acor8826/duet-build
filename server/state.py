@@ -29,6 +29,12 @@ class Session:
     pending_tool_args: Optional[Dict[str, Any]] = None
     last_final: Optional[Dict[str, Any]] = None
     closed: bool = False
+    # Document exchange (push + multi-step pull). All default-valued so older
+    # on-disk session JSON (written before these fields existed) still loads via
+    # from_dict / cls(**d).
+    documents: List[Dict[str, Any]] = field(default_factory=list)  # full text pushed to GPT at start
+    available_documents: List[Dict[str, Any]] = field(default_factory=list)  # catalog GPT may pull from
+    doc_requests_made: int = 0  # count of request_document tool calls this turn (budget guard)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
