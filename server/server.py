@@ -30,12 +30,6 @@ import duet_run as duet_run_mod  # noqa: E402  (aliased: the MCP tool below is n
 
 load_dotenv()
 
-# Lazy-import openai so tests can monkeypatch.
-def _openai_client():
-    from openai import OpenAI
-    return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-
 MODEL = os.environ.get("OPENAI_PARTNER_MODEL", "gpt-5.5")
 STATE_DIR = os.environ.get("DUET_STATE_DIR", str(Path.home() / ".claude" / "duet"))
 TRANSPORT = os.environ.get("DUET_TRANSPORT", "stdio")
@@ -45,6 +39,48 @@ BEARER = os.environ.get("DUET_MCP_BEARER")
 # Document-exchange limits.
 DUET_MAX_DOC_CHARS = int(os.environ.get("DUET_MAX_DOC_CHARS", "100000"))  # per-document content cap
 DUET_MAX_DOC_REQUESTS = int(os.environ.get("DUET_MAX_DOC_REQUESTS", "4"))  # request_document budget per turn
+
+# Bounded-call knobs. The OpenAI loop runs synchronously inside the MCP tool handler, so
+# the HTTP response blocks until GPT finishes. On a large pushed payload that generation
+# can outrun the MCP CLIENT's ~180s tool-call cap (the cap is client-side, not here — Cloud
+# Run allows 900s), and the call silently overruns instead of returning. These keep every
+# call inside the window: a sub-cap request timeout, no retry storms, a bounded response,
+# and a cumulative cap on pushed-document text. All are env-tunable with safe defaults.
+DUET_OPENAI_TIMEOUT = float(os.environ.get("DUET_OPENAI_TIMEOUT", "150"))  # seconds, < 180s client cap
+DUET_OPENAI_MAX_RETRIES = int(os.environ.get("DUET_OPENAI_MAX_RETRIES", "0"))  # SDK retries would multiply wall-clock
+DUET_MAX_OUTPUT_TOKENS = int(os.environ.get("DUET_MAX_OUTPUT_TOKENS", "4000"))  # cap response generation
+DUET_OUTPUT_TOKEN_PARAM = os.environ.get("DUET_OUTPUT_TOKEN_PARAM", "max_tokens")  # or "max_completion_tokens"
+DUET_MAX_TOTAL_DOC_CHARS = int(os.environ.get("DUET_MAX_TOTAL_DOC_CHARS", "120000"))  # cumulative pushed-doc cap
+
+# Below this candidate size the payload is "small" and gets no concise-critique nudge.
+_CONCISE_NUDGE_CANDIDATE_CHARS = 8000
+
+
+# Lazy-import openai so tests can monkeypatch.
+def _openai_client():
+    from openai import OpenAI
+    return OpenAI(
+        api_key=os.environ["OPENAI_API_KEY"],
+        timeout=DUET_OPENAI_TIMEOUT,
+        max_retries=DUET_OPENAI_MAX_RETRIES,
+    )
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    """True if exc is an OpenAI timeout / connection error.
+
+    Lets the loop return a clean, retriable signal inside the client window instead of
+    letting the call overrun the ~180s cap. Matches by type when openai is importable,
+    else falls back to the class name so a stubbed client (tests) can signal a timeout.
+    """
+    try:
+        from openai import APITimeoutError, APIConnectionError
+        if isinstance(exc, (APITimeoutError, APIConnectionError)):
+            return True
+    except Exception:  # pragma: no cover - openai always present in practice
+        pass
+    name = type(exc).__name__
+    return "Timeout" in name or "APIConnectionError" in name
 
 _STORE = SessionStore(STATE_DIR)
 
@@ -113,19 +149,27 @@ def _truncate_doc(content: str) -> tuple[str, bool]:
     return content, False
 
 
-def _render_document_block(doc: Dict[str, Any]) -> str:
-    """Render one pushed document as a clearly delimited block GPT can quote/pin-cite."""
+def _render_document_block(doc: Dict[str, Any], budget: Optional[int] = None) -> tuple[str, int]:
+    """Render one pushed document as a clearly delimited block GPT can quote/pin-cite.
+
+    Applies the per-document cap (DUET_MAX_DOC_CHARS) and, when ``budget`` is given, the
+    remaining cumulative cap (whichever is smaller). Returns (block, content_chars_used)
+    so the caller can decrement the running cumulative budget.
+    """
     name = doc.get("name") or doc.get("id") or "document"
     source = doc.get("source")
     content, truncated = _truncate_doc(doc.get("content", ""))
     truncated = truncated or bool(doc.get("truncated"))
+    if budget is not None and len(content) > budget:
+        content = content[:budget]
+        truncated = True
     header = f"=== DOCUMENT: {name}"
     if source:
         header += f" [{source}]"
     if truncated:
         header += " (truncated)"
     header += " ==="
-    return f"{header}\n{content}\n=== END DOCUMENT: {name} ==="
+    return f"{header}\n{content}\n=== END DOCUMENT: {name} ===", len(content)
 
 
 def _build_user_message(
@@ -140,8 +184,24 @@ def _build_user_message(
         parts += ["CURRENT CANDIDATE FROM OPUS:", candidate, ""]
     if documents:
         parts.append("ATTACHED DOCUMENTS (use their actual contents in your analysis):")
+        # Cumulative cap across all pushed docs (the per-doc cap alone lets N big docs sum
+        # into one over-long blocking call). Once spent, omit the rest with a clear marker
+        # so GPT knows they exist and can pull them individually via request_document.
+        remaining = DUET_MAX_TOTAL_DOC_CHARS
+        omitted = 0
         for d in documents:
-            parts += [_render_document_block(d), ""]
+            if remaining <= 0:
+                omitted += 1
+                continue
+            block, used = _render_document_block(d, budget=remaining)
+            remaining -= used
+            parts += [block, ""]
+        if omitted:
+            parts += [
+                f"[{omitted} document(s) omitted to fit the size budget — request them "
+                "individually via request_document]",
+                "",
+            ]
     if available_documents:
         parts += [
             "AVAILABLE DOCUMENTS — you do not have these yet, but you can fetch the full",
@@ -158,6 +218,17 @@ def _build_user_message(
         parts.append("")
     if history_note:
         parts += ["NOTE:", history_note, ""]
+    # On a large payload, ask for a tight critique so the response stays inside the time
+    # budget (the manual condense-and-ask-for-concise workaround, made automatic).
+    large_payload = bool(documents) or (
+        candidate is not None and len(candidate) > _CONCISE_NUDGE_CANDIDATE_CHARS)
+    if large_payload:
+        parts += [
+            "NOTE — the attached material is large: keep your critique tight and focused. "
+            "Pin-point the highest-severity issues with cites; do not restate or summarise "
+            "the documents. Return only the JSON.",
+            "",
+        ]
     parts += [
         "Respond with a JSON object matching the WorkProduct schema:",
         '{"role":..., "candidate_id":..., "counter_draft":..., '
@@ -196,11 +267,39 @@ def _run_openai_loop(session: Session) -> Dict[str, Any]:
                 "tool_choice": "none",
                 "response_format": {"type": "json_object"},
             }
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=session.history,
-            **call_kwargs,
-        )
+        # Bound the response so generation can't run past the client window.
+        call_kwargs[DUET_OUTPUT_TOKEN_PARAM] = DUET_MAX_OUTPUT_TOKENS
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=session.history,
+                **call_kwargs,
+            )
+        except Exception as e:
+            if not _is_timeout_error(e):
+                raise
+            # The call outran the time budget. Return a clean, retriable signal INSIDE the
+            # client window instead of letting it overrun the ~180s cap. No pending tool was
+            # set this iteration, so the session stays clean for a condensed retry.
+            print(
+                f"[duet-bridge] session={session.session_id}: GPT call timed out after "
+                f"~{DUET_OPENAI_TIMEOUT:.0f}s ({type(e).__name__}); returning gpt_timeout.",
+                file=sys.stderr,
+            )
+            return {
+                "status": "error",
+                "payload": {
+                    "error": "gpt_timeout",
+                    "retriable": True,
+                    "elapsed_s": DUET_OPENAI_TIMEOUT,
+                    "hint": (
+                        "The payload was too large to critique within the time budget. Retry "
+                        "with a tightly condensed candidate and an explicit request for a "
+                        "concise critique, send fewer/smaller documents, or advertise them via "
+                        "available_documents and let GPT pull them one at a time."
+                    ),
+                },
+            }
         choice = resp.choices[0]
         msg = choice.message
 

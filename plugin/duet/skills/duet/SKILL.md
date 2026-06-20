@@ -92,6 +92,21 @@ successive requests until the turn returns `status: "final"`. Branch on
   may request several documents in succession (e.g. a vault file, then a referenced
   exhibit) before delivering its critique. Document content is sent to GPT/OpenAI.
 
+### Large documents & the time budget
+The GPT critique runs inside one tool call, and the MCP client caps tool calls at
+**~180s**. A big PUSH (large `candidate` + many/large `documents`) critiques everything in
+one long call and can hit that cap; the bridge bounds the work and, if a call still outruns
+the budget, returns `status:"error"` with `payload.error == "gpt_timeout"` (`retriable:true`)
+**inside the window** rather than hanging.
+- **Prefer PULL for large/many docs.** Advertise them via `available_documents` and let GPT
+  fetch what it needs with `request_document` — that splits the work into several short calls,
+  each its own round-trip inside the window — instead of pushing everything in one long call.
+- **On a `gpt_timeout` error, retry once**: re-send a tightly condensed `candidate` with an
+  explicit request for a *concise* critique, and/or move large `documents` into
+  `available_documents` so GPT pulls them. That reliably returns inside the window.
+- Pushed docs are bounded by a cumulative size budget; any over-budget ones are dropped with
+  a `[N document(s) omitted …]` marker and can still be pulled via `request_document`.
+
 ## Fallback flow — one-call `duet_run` (for non-Claude orchestrators)
 
 If for some reason you cannot act as the Opus side (e.g. an automated/headless

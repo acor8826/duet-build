@@ -319,7 +319,7 @@ side (Claude Code / cowork / web), which is the only party with that access.
 
 | Param                 | Shape                                             | Effect                                                                 |
 |-----------------------|---------------------------------------------------|------------------------------------------------------------------------|
-| `documents`           | `[{name, content, mime?, source?}]`               | Full text is rendered into GPT's first message as delimited `=== DOCUMENT: name ===` blocks (capped at `DUET_MAX_DOC_CHARS`). |
+| `documents`           | `[{name, content, mime?, source?}]`               | Full text is rendered into GPT's first message as delimited `=== DOCUMENT: name ===` blocks (per-doc cap `DUET_MAX_DOC_CHARS`; cumulative cap `DUET_MAX_TOTAL_DOC_CHARS` — see **Size & time budget**). |
 | `available_documents` | `[{name, description?, source?}]`                 | A catalog advertised to GPT; it can fetch any entry's full text on demand via `request_document`. |
 
 **Pull (GPT → Claude, multi-step).** GPT can emit a `request_document` tool call
@@ -350,6 +350,34 @@ interactive, multi-step pull (e.g. a co-work vault).
 
 **Privacy.** Document content is sent cross-vendor to GPT/OpenAI. The orchestrator
 instructions surface this as a one-line note and otherwise send freely.
+
+**Size & time budget.** The GPT critique runs synchronously inside the MCP tool call, so a
+big PUSH is one long blocking call — and the **MCP client caps tool calls at ~180s** (the
+cap is client-side; Cloud Run itself allows 900s). To keep every call inside that window the
+bridge bounds the work and fails fast rather than overrunning silently:
+
+| Env var | Default | Effect |
+|---|---|---|
+| `DUET_OPENAI_TIMEOUT` | `150` | OpenAI request timeout in seconds — kept **below** the ~180s client cap. |
+| `DUET_OPENAI_MAX_RETRIES` | `0` | No SDK retry storms that would multiply wall-clock past the cap. |
+| `DUET_MAX_OUTPUT_TOKENS` | `4000` | Caps response generation (the dominant latency term). |
+| `DUET_OUTPUT_TOKEN_PARAM` | `max_tokens` | Param name for the cap; set to `max_completion_tokens` if the model requires it. |
+| `DUET_MAX_TOTAL_DOC_CHARS` | `120000` | **Cumulative** cap across all pushed docs in one call (the per-doc `DUET_MAX_DOC_CHARS` still applies). Over-budget docs are omitted with a `[N document(s) omitted …]` marker; GPT can still pull them via `request_document`. |
+
+If a call still outruns the budget the bridge returns, **inside the window**, a clean
+retriable error instead of hanging:
+
+```
+{"status":"error","payload":{"error":"gpt_timeout","retriable":true,"elapsed_s":150,
+ "hint":"… retry with a tightly condensed candidate and a concise critique, send fewer/
+         smaller documents, or advertise them via available_documents and let GPT pull …"}}
+```
+
+**Guidance for large/many documents:** prefer **PULL** (`available_documents` +
+`request_document`) over a big PUSH. Pull splits the work into several short calls — each its
+own tool round-trip inside the window — whereas a single large PUSH critiques everything in
+one long call that can hit the cap. On a `gpt_timeout`, retry once with a condensed candidate
+and an explicit request for a concise critique.
 
 ## Worked-example runbook (step 10 of the build plan)
 

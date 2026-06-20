@@ -41,6 +41,37 @@ DEFAULT_THRESHOLD = int(os.environ.get("DUET_CONFIDENCE_THRESHOLD", "95"))
 DEFAULT_CAP = int(os.environ.get("DUET_ITERATION_CAP", "8"))
 MAX_DOC_CHARS = int(os.environ.get("DUET_MAX_DOC_CHARS", "100000"))  # per-document content cap (push)
 
+# Bounded-call knobs (shared names with server.py). run_duet runs the whole loop inside one
+# synchronous tool call, so an unbounded model call can outrun the client's ~180s cap. These
+# bound each individual model call; the full-loop duration is still inherently long (this is
+# the headless fallback path), but a single hung call now fails fast and retriably.
+OPENAI_TIMEOUT = float(os.environ.get("DUET_OPENAI_TIMEOUT", "150"))  # per-call request timeout (s)
+OPENAI_MAX_RETRIES = int(os.environ.get("DUET_OPENAI_MAX_RETRIES", "0"))
+MAX_OUTPUT_TOKENS = int(os.environ.get("DUET_MAX_OUTPUT_TOKENS", "4000"))
+OUTPUT_TOKEN_PARAM = os.environ.get("DUET_OUTPUT_TOKEN_PARAM", "max_tokens")
+
+
+class DuetTimeout(Exception):
+    """A single model call outran the time budget — surfaced as a retriable error."""
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    """True for OpenAI/Anthropic timeout / connection errors (match by type, else by name)."""
+    try:
+        from openai import APITimeoutError, APIConnectionError
+        if isinstance(exc, (APITimeoutError, APIConnectionError)):
+            return True
+    except Exception:  # pragma: no cover
+        pass
+    try:
+        import anthropic
+        if isinstance(exc, (anthropic.APITimeoutError, anthropic.APIConnectionError)):
+            return True
+    except Exception:  # pragma: no cover
+        pass
+    name = type(exc).__name__
+    return "Timeout" in name or "APIConnectionError" in name
+
 
 def opus_available() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY"))
@@ -87,25 +118,44 @@ def _render_documents(documents: Optional[List[Dict[str, Any]]]) -> str:
 
 def _opus_call(system: str, user: str, max_tokens: int = 4096) -> str:
     import anthropic
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    msg = client.messages.create(
-        model=OPUS_MODEL,
-        max_tokens=max_tokens,
-        # cache the (reused) system prompt across the loop's Opus turns
-        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-        messages=[{"role": "user", "content": user}],
+    client = anthropic.Anthropic(
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+        timeout=OPENAI_TIMEOUT,
+        max_retries=OPENAI_MAX_RETRIES,
     )
+    try:
+        msg = client.messages.create(
+            model=OPUS_MODEL,
+            max_tokens=max_tokens,
+            # cache the (reused) system prompt across the loop's Opus turns
+            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": user}],
+        )
+    except Exception as e:
+        if _is_timeout_error(e):
+            raise DuetTimeout(f"Opus call timed out after ~{OPENAI_TIMEOUT:.0f}s") from e
+        raise
     return "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", None) == "text")
 
 
 def _gpt_call(system: str, user: str) -> str:
     from openai import OpenAI
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    resp = client.chat.completions.create(
-        model=GPT_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        response_format={"type": "json_object"},
+    client = OpenAI(
+        api_key=os.environ["OPENAI_API_KEY"],
+        timeout=OPENAI_TIMEOUT,
+        max_retries=OPENAI_MAX_RETRIES,
     )
+    try:
+        resp = client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
+            **{OUTPUT_TOKEN_PARAM: MAX_OUTPUT_TOKENS},
+        )
+    except Exception as e:
+        if _is_timeout_error(e):
+            raise DuetTimeout(f"GPT call timed out after ~{OPENAI_TIMEOUT:.0f}s") from e
+        raise
     return resp.choices[0].message.content or "{}"
 
 
@@ -192,6 +242,31 @@ def _verify_user(spec: str, candidate: str, docs_block: str = "") -> str:
 def run_duet(spec: str, threshold: Optional[int] = None,
              iteration_cap: Optional[int] = None,
              documents: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Run the full server-side consensus loop, failing fast on a model timeout.
+
+    Thin wrapper over `_run_duet_inner`: if any single Opus/GPT call outruns the time
+    budget (`DuetTimeout`), return a clean, retriable error instead of hanging past the
+    client's ~180s tool-call cap.
+    """
+    try:
+        return _run_duet_inner(spec, threshold=threshold,
+                               iteration_cap=iteration_cap, documents=documents)
+    except DuetTimeout as e:
+        return {
+            "status": "error",
+            "error": f"gpt_timeout: {e}",
+            "retriable": True,
+            "hint": (
+                "A model call exceeded the time budget. Retry with a shorter spec / fewer "
+                "or smaller documents, or drive the loop client-side via "
+                "duet_gpt_start_turn / duet_gpt_resume_turn for finer-grained calls."
+            ),
+        }
+
+
+def _run_duet_inner(spec: str, threshold: Optional[int] = None,
+                    iteration_cap: Optional[int] = None,
+                    documents: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Run the full server-side consensus loop and return the final artifact.
 
     documents (optional, PUSH-ONLY): list of {name, content, source?} whose full text is

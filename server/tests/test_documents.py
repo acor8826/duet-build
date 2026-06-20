@@ -124,6 +124,29 @@ class PushRendering(unittest.TestCase):
         finally:
             srv.DUET_MAX_DOC_CHARS = orig
 
+    def test_cumulative_doc_budget_trims_and_notes(self) -> None:
+        # Per-doc cap is generous; the CUMULATIVE cap is what bounds a multi-doc push so the
+        # one blocking critique call stays inside the client window.
+        orig_total = srv.DUET_MAX_TOTAL_DOC_CHARS
+        srv.DUET_MAX_TOTAL_DOC_CHARS = 15
+        try:
+            msg = srv._build_user_message(
+                "spec", None, "",
+                documents=[
+                    {"name": "d1", "content": "AAAAAAAAAA"},  # 10 -> fits (remaining 5)
+                    {"name": "d2", "content": "BBBBBBBBBB"},  # 10 -> truncated to 5 (remaining 0)
+                    {"name": "d3", "content": "CCCCCCCCCC"},  # omitted, budget spent
+                ],
+            )
+            self.assertIn("AAAAAAAAAA", msg)          # first doc whole
+            self.assertIn("BBBBB", msg)               # second doc partially included
+            self.assertNotIn("BBBBBBBBBB", msg)       # ...but truncated by the cumulative cap
+            self.assertNotIn("CCCCCCCCCC", msg)       # third doc omitted entirely
+            self.assertIn("1 document(s) omitted", msg)
+            self.assertIn("request them", msg)        # points GPT at request_document
+        finally:
+            srv.DUET_MAX_TOTAL_DOC_CHARS = orig_total
+
 
 # ---------------------- pull (GPT -> Claude, multi-step) ----------------------
 
