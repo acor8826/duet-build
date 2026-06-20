@@ -52,6 +52,25 @@ DUET_MAX_OUTPUT_TOKENS = int(os.environ.get("DUET_MAX_OUTPUT_TOKENS", "4000"))  
 DUET_OUTPUT_TOKEN_PARAM = os.environ.get("DUET_OUTPUT_TOKEN_PARAM", "max_tokens")  # or "max_completion_tokens"
 DUET_MAX_TOTAL_DOC_CHARS = int(os.environ.get("DUET_MAX_TOTAL_DOC_CHARS", "120000"))  # cumulative pushed-doc cap
 
+# Live Google Drive for the GPT side. When DUET_USE_RESPONSES_API is on, the bridge calls
+# GPT through the OpenAI Responses API with Google Drive attached as a hosted connector tool,
+# so GPT reads the case files itself INSIDE its own runtime (the Drive calls do NOT relay
+# back through Claude — only claude_slash_command / request_document do). Default OFF, so the
+# existing chat.completions path and all current tests are untouched. The connector field
+# names below match the documented OpenAI shape and are env-overridable. NOTE on scoping:
+# the Drive connector uses the all-or-nothing `drive.readonly` OAuth scope — there is NO
+# connector field that limits it to specific folders. To restrict GPT to the two case
+# folders, authorize a DEDICATED Google account / restricted shared drive that can only see
+# them. DUET_DRIVE_FOLDER_IDS is only a hint surfaced to GPT, NOT a security boundary.
+DUET_USE_RESPONSES_API = os.environ.get("DUET_USE_RESPONSES_API", "0").lower() in ("1", "true", "yes")
+DUET_DRIVE_CONNECTOR_ID = os.environ.get("DUET_DRIVE_CONNECTOR_ID", "")  # e.g. "connector_googledrive"; empty disables the Drive tool
+DUET_DRIVE_TOOL_TYPE = os.environ.get("DUET_DRIVE_TOOL_TYPE", "mcp")  # hosted-tool type ("mcp" / "connector")
+DUET_DRIVE_SERVER_LABEL = os.environ.get("DUET_DRIVE_SERVER_LABEL", "google_drive")
+DUET_DRIVE_REQUIRE_APPROVAL = os.environ.get("DUET_DRIVE_REQUIRE_APPROVAL", "never")  # "never" => no approval round-trip
+DUET_DRIVE_AUTH = os.environ.get("DUET_DRIVE_AUTH", "")  # OAuth access token for the connector (expires; refresh is connector-side)
+DUET_DRIVE_FOLDER_IDS = os.environ.get("DUET_DRIVE_FOLDER_IDS", "")  # comma-separated Drive folder IDs (the two case folders)
+DUET_DRIVE_ALLOWED_TOOLS = os.environ.get("DUET_DRIVE_ALLOWED_TOOLS", "")  # optional comma-separated allow-list of connector tool names
+
 # Below this candidate size the payload is "small" and gets no concise-critique nudge.
 _CONCISE_NUDGE_CANDIDATE_CHARS = 8000
 
@@ -141,6 +160,46 @@ REQUEST_DOCUMENT_TOOL = {
 }
 
 
+def _to_responses_function_tool(tool: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a chat-completions function tool into the Responses-API tool shape.
+
+    chat.completions nests the spec under a "function" key; the Responses API expects the
+    name/description/parameters at the top level alongside type:"function".
+    """
+    fn = tool["function"]
+    return {
+        "type": "function",
+        "name": fn["name"],
+        "description": fn.get("description", ""),
+        "parameters": fn.get("parameters", {}),
+    }
+
+
+def _drive_tool() -> Optional[Dict[str, Any]]:
+    """Build the hosted Google Drive connector tool for the Responses API, or None.
+
+    Returns None when no connector is configured (DUET_DRIVE_CONNECTOR_ID empty) so the
+    Responses path simply runs without live Drive and GPT falls back to request_document.
+    The field names follow the documented OpenAI connector shape but are env-overridable
+    (see the DUET_DRIVE_* config) because the exact API spelling is the one thing to verify
+    against current OpenAI docs before relying on it in production.
+    """
+    if not DUET_DRIVE_CONNECTOR_ID:
+        return None
+    tool: Dict[str, Any] = {
+        "type": DUET_DRIVE_TOOL_TYPE,
+        "server_label": DUET_DRIVE_SERVER_LABEL,
+        "connector_id": DUET_DRIVE_CONNECTOR_ID,
+        "require_approval": DUET_DRIVE_REQUIRE_APPROVAL,
+    }
+    if DUET_DRIVE_AUTH:
+        tool["authorization"] = DUET_DRIVE_AUTH
+    allowed = [t.strip() for t in DUET_DRIVE_ALLOWED_TOOLS.split(",") if t.strip()]
+    if allowed:
+        tool["allowed_tools"] = allowed
+    return tool
+
+
 def _truncate_doc(content: str) -> tuple[str, bool]:
     """Cap a document body at DUET_MAX_DOC_CHARS; return (text, was_truncated)."""
     content = "" if content is None else str(content)
@@ -172,14 +231,57 @@ def _render_document_block(doc: Dict[str, Any], budget: Optional[int] = None) ->
     return f"{header}\n{content}\n=== END DOCUMENT: {name} ===", len(content)
 
 
+def _render_folder_catalogue(folder_catalogue: List[Dict[str, Any]]) -> List[str]:
+    """Render the case-folder catalogue as a cheap MANIFEST (names/ids/mime only).
+
+    Only the listing is sent — never the file bytes — so this sidesteps the per-doc and
+    cumulative document-size caps. With live Drive GPT opens the listed files itself; without
+    it, GPT can still name them to request_document.
+    """
+    lines = [
+        "CASE-FOLDER CATALOGUE — these Google Drive folders hold the case record.",
+        "Read the relevant documents from Drive yourself to understand the matter BEFORE",
+        "you review the task/candidate below. If you cannot open a file directly, request",
+        "it by name via the request_document tool.",
+    ]
+    for folder in folder_catalogue:
+        fname = folder.get("folder_name") or folder.get("name") or "folder"
+        header = f"== FOLDER: {fname}"
+        if folder.get("folder_id"):
+            header += f" [id:{folder['folder_id']}]"
+        header += " =="
+        lines.append(header)
+        files = folder.get("files") or []
+        if not files:
+            lines.append("  (no files listed)")
+        for f in files:
+            entry = f"  - {f.get('name') or f.get('id') or 'file'}"
+            if f.get("file_id"):
+                entry += f" [id:{f['file_id']}]"
+            if f.get("mime"):
+                entry += f" ({f['mime']})"
+            lines.append(entry)
+    lines.append("")
+    return lines
+
+
 def _build_user_message(
     spec: str,
     candidate: Optional[str],
     history_note: str = "",
     documents: Optional[List[Dict[str, Any]]] = None,
     available_documents: Optional[List[Dict[str, Any]]] = None,
+    project_name: str = "",
+    folder_catalogue: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    parts = ["SPEC:", spec, ""]
+    parts: List[str] = []
+    # Matter grounding goes FIRST so GPT knows which case the request relates to and what the
+    # record contains before it reads the spec/candidate.
+    if project_name:
+        parts += ["PROJECT / MATTER:", project_name, ""]
+    if folder_catalogue:
+        parts += _render_folder_catalogue(folder_catalogue)
+    parts += ["SPEC:", spec, ""]
     if candidate:
         parts += ["CURRENT CANDIDATE FROM OPUS:", candidate, ""]
     if documents:
@@ -364,6 +466,172 @@ def _run_openai_loop(session: Session) -> Dict[str, Any]:
         return {"status": "final", "payload": payload}
 
 
+def _system_text(session: Session) -> str:
+    """The role system prompt for this session (history[0], or PROMPTS fallback)."""
+    for m in session.history:
+        if m.get("role") == "system":
+            return m.get("content", "")
+    return PROMPTS.get(session.role, "")
+
+
+def _latest_user_text(session: Session) -> str:
+    """The most recent user message text in the session history."""
+    for m in reversed(session.history):
+        if m.get("role") == "user":
+            return m.get("content", "")
+    return ""
+
+
+def _run_responses_loop(session: Session) -> Dict[str, Any]:
+    """Responses-API variant of the GPT loop with hosted Google Drive.
+
+    Differs from _run_openai_loop only in HOW GPT is called: via the OpenAI Responses API
+    with Google Drive attached as a hosted connector tool, so GPT reads the case files inside
+    its own runtime. Hosted Drive calls are resolved by OpenAI and never come back to us; only
+    the two *function* tools (claude_slash_command / request_document) suspend the turn, so the
+    existing suspend/resume contract, persistence, and WorkProduct schema are all preserved.
+
+    Continuity uses ``previous_response_id`` (set on the first call, chained thereafter). That
+    keeps reasoning-model context — including any Drive reads — server-side across the relay
+    round-trip and across bridge restarts, without us reconstructing the message list.
+    """
+    client = _openai_client()
+    fn_tools = [
+        _to_responses_function_tool(CLAUDE_SLASH_TOOL),
+        _to_responses_function_tool(REQUEST_DOCUMENT_TOOL),
+    ]
+    drive = _drive_tool()
+    tools = ([drive] if drive else []) + fn_tools
+
+    call_kwargs: Dict[str, Any] = {
+        "model": MODEL,
+        "tools": tools,
+        "parallel_tool_calls": False,
+        "max_output_tokens": DUET_MAX_OUTPUT_TOKENS,
+    }
+    if session.doc_requests_made < DUET_MAX_DOC_REQUESTS:
+        call_kwargs["tool_choice"] = "auto"
+    else:
+        # Document-request budget exhausted — force a final WorkProduct.
+        call_kwargs["tool_choice"] = "none"
+        call_kwargs["text"] = {"format": {"type": "json_object"}}
+
+    # instructions are NOT inherited across previous_response_id — the Responses API applies
+    # them per-call — so resend the role system prompt on EVERY call, not just the first.
+    call_kwargs["instructions"] = _system_text(session)
+    last = session.history[-1] if session.history else {}
+    if session.last_response_id and last.get("role") == "tool":
+        # Continuation after a relayed tool result: chain and send only the new output.
+        call_kwargs["previous_response_id"] = session.last_response_id
+        call_kwargs["input"] = [{
+            "type": "function_call_output",
+            "call_id": last.get("tool_call_id"),
+            "output": last.get("content", ""),
+        }]
+    else:
+        # First call of the turn: user message as input (instructions set above).
+        call_kwargs["input"] = [{"role": "user", "content": _latest_user_text(session)}]
+
+    try:
+        resp = client.responses.create(**call_kwargs)
+    except Exception as e:
+        if not _is_timeout_error(e):
+            raise
+        print(
+            f"[duet-bridge] session={session.session_id}: GPT Responses call timed out after "
+            f"~{DUET_OPENAI_TIMEOUT:.0f}s ({type(e).__name__}); returning gpt_timeout.",
+            file=sys.stderr,
+        )
+        return {
+            "status": "error",
+            "payload": {
+                "error": "gpt_timeout",
+                "retriable": True,
+                "elapsed_s": DUET_OPENAI_TIMEOUT,
+                "hint": (
+                    "The case payload was too large to handle within the time budget. Retry "
+                    "with a tighter spec, a smaller folder catalogue, or fewer Drive reads."
+                ),
+            },
+        }
+
+    session.last_response_id = getattr(resp, "id", None) or session.last_response_id
+
+    # Audit: log any Drive reads the model made server-side (mcp_call items), so the bridge
+    # log shows which case files GPT actually opened. These need no action from us.
+    for item in (getattr(resp, "output", None) or []):
+        if getattr(item, "type", None) == "mcp_call":
+            args = str(getattr(item, "arguments", ""))[:200]
+            print(
+                f"[duet-bridge] session={session.session_id}: drive read "
+                f"{getattr(item, 'server_label', '?')}.{getattr(item, 'name', '?')} {args}",
+                file=sys.stderr,
+            )
+
+    # First custom function_call in the output suspends the turn. Hosted Drive (mcp_call)
+    # items are already resolved inside GPT's runtime and need no action from us.
+    fc = None
+    for item in (getattr(resp, "output", None) or []):
+        if getattr(item, "type", None) == "function_call":
+            fc = item
+            break
+
+    if fc is not None:
+        name = getattr(fc, "name", "") or ""
+        arguments = getattr(fc, "arguments", "") or "{}"
+        call_id = getattr(fc, "call_id", None) or getattr(fc, "id", "")
+        # Persist in chat shape for audit + resume bookkeeping. History is NOT re-sent —
+        # previous_response_id carries the real (reasoning-preserving) context.
+        session.history.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": call_id, "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }],
+        })
+        try:
+            args = json.loads(arguments)
+        except json.JSONDecodeError:
+            args = {"_raw": arguments}
+        if name == "request_document":
+            session.doc_requests_made += 1
+        session.pending_tool_use_id = call_id
+        session.pending_tool_name = name
+        session.pending_tool_args = args
+        _STORE.put(session)
+        return {
+            "status": "tool_request",
+            "payload": {"tool_name": name, "tool_args": args, "tool_use_id": call_id},
+        }
+
+    # No function call → final. Parse tolerantly, same as the chat path.
+    text = getattr(resp, "output_text", None) or ""
+    session.history.append({"role": "assistant", "content": text})
+    wp_dict = _json_obj(text)
+    if not wp_dict:
+        wp_dict = {"role": session.role, "candidate_id": "unknown",
+                   "notes": text, "critique_items": []}
+    try:
+        wp = WorkProduct.model_validate(wp_dict)
+        payload = wp.model_dump()
+    except Exception as e:
+        payload = {"_validation_error": str(e), "_raw": wp_dict}
+    session.last_final = payload
+    session.pending_tool_use_id = None
+    session.pending_tool_name = None
+    session.pending_tool_args = None
+    _STORE.put(session)
+    return {"status": "final", "payload": payload}
+
+
+def _run_loop(session: Session) -> Dict[str, Any]:
+    """Dispatch to the Responses-API loop (live Drive) or the chat.completions loop."""
+    if DUET_USE_RESPONSES_API:
+        return _run_responses_loop(session)
+    return _run_openai_loop(session)
+
+
 # ---------------------- MCP tool surface ----------------------
 
 try:
@@ -382,6 +650,8 @@ def _start_turn_impl(
     history_note: str,
     documents: Optional[List[Dict[str, Any]]] = None,
     available_documents: Optional[List[Dict[str, Any]]] = None,
+    project_name: str = "",
+    folder_catalogue: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     if role not in PROMPTS:
         return {"status": "error", "payload": {
@@ -400,14 +670,17 @@ def _start_turn_impl(
             spec=spec,
             documents=list(documents or []),
             available_documents=list(available_documents or []),
+            project_name=project_name or "",
+            folder_catalogue=list(folder_catalogue or []),
             history=[
                 {"role": "system", "content": PROMPTS[role]},
                 {"role": "user", "content": _build_user_message(
-                    spec, candidate, history_note, documents, available_documents)},
+                    spec, candidate, history_note, documents, available_documents,
+                    project_name=project_name or "", folder_catalogue=folder_catalogue)},
             ],
         )
         _STORE.put(session)
-    result = _run_openai_loop(session)
+    result = _run_loop(session)
     result["session_id"] = sid
     return result
 
@@ -444,7 +717,7 @@ def _resume_turn_impl(
     session.pending_tool_name = None
     session.pending_tool_args = None
     _STORE.put(session)
-    result = _run_openai_loop(session)
+    result = _run_loop(session)
     result["session_id"] = session_id
     return result
 
@@ -465,6 +738,8 @@ def _health_impl() -> Dict[str, Any]:
         "state_dir": STATE_DIR,
         "opus_model": duet_run_mod.OPUS_MODEL,
         "duet_run_available": duet_run_mod.opus_available(),
+        "responses_api": DUET_USE_RESPONSES_API,
+        "drive_connector": bool(DUET_DRIVE_CONNECTOR_ID),
     }
 
 
@@ -479,6 +754,8 @@ if mcp is not None:
         session_id: Optional[str] = None,
         documents: Optional[List[Dict[str, Any]]] = None,
         available_documents: Optional[List[Dict[str, Any]]] = None,
+        project_name: str = "",
+        folder_catalogue: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Start a GPT turn. Returns either {status:'tool_request', ...} or {status:'final', ...}.
 
@@ -492,9 +769,20 @@ if mcp is not None:
             orchestrator resolves it (e.g. from a co-work vault) and replies via
             duet_gpt_resume_turn. GPT may pull several documents in succession before its
             final answer (a two-way, multi-step exchange).
+
+        Case/matter grounding (optional — pass on EVERY turn, critic and verifier):
+          * project_name: the matter name (e.g. "Smith v Commonwealth") so GPT knows which
+            case the request relates to.
+          * folder_catalogue: a MANIFEST of the case Drive folders —
+            [{folder_name, folder_id?, files:[{name, file_id?, mime?}]}]. Only the listing is
+            sent (not the bytes), so it does not consume the document-size caps. When the
+            bridge runs with DUET_USE_RESPONSES_API + a configured Drive connector, GPT opens
+            the listed files from Drive itself before reviewing the task; otherwise it falls
+            back to request_document. Both are injected ahead of SPEC in the user message.
         """
         return _start_turn_impl(
-            session_id, role, spec, candidate, history_note, documents, available_documents)
+            session_id, role, spec, candidate, history_note, documents, available_documents,
+            project_name=project_name, folder_catalogue=folder_catalogue)
 
     @mcp.tool()
     def duet_gpt_resume_turn(
@@ -519,6 +807,7 @@ if mcp is not None:
         threshold: Optional[int] = None,
         iteration_cap: Optional[int] = None,
         documents: Optional[List[Dict[str, Any]]] = None,
+        project_name: str = "",
     ) -> Dict[str, Any]:
         """Run the FULL two-model consensus loop server-side and return the final artifact.
 
@@ -538,13 +827,17 @@ if mcp is not None:
                 duet_run is PUSH-ONLY for documents — there is no orchestrator here, so GPT
                 cannot pull additional documents (use the duet_gpt_start_turn / resume
                 bridge path for the interactive, multi-step pull, e.g. from a co-work vault).
+            project_name: Optional matter name, prepended to every model prompt so both
+                models know which case the work relates to. Headless mode has NO live Drive —
+                case documents must be PUSHed via `documents` or they are invisible here.
 
         Returns a dict with accepted, gate, final_candidate, scores, verifier,
         suggested_improvements, and a step transcript. Requires ANTHROPIC_API_KEY to be
         configured on the bridge for the Opus role; returns status:'error' otherwise.
         """
         return duet_run_mod.run_duet(
-            spec, threshold=threshold, iteration_cap=iteration_cap, documents=documents)
+            spec, threshold=threshold, iteration_cap=iteration_cap, documents=documents,
+            project_name=project_name)
 
 
 def _build_http_app():

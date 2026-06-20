@@ -58,6 +58,36 @@ pwsh ./server/deploy.ps1        # redeploy so Cloud Run mounts the secret
 `duet_health` then reports `"duet_run_available": true`. (Already done in this
 project; activating it just needs credits on the Anthropic account.)
 
+## 2b. (OPTIONAL) Give GPT live Google Drive for case folders
+
+For legal-matter work you can have the GPT side read the case files **from Google
+Drive itself**, so you pass only a folder *catalogue* (file names/ids) and GPT opens
+the documents to understand the matter before reviewing your candidate. This needs
+the bridge deployed on the **Responses-API path** with an OpenAI Google Drive
+connector:
+
+```
+# 1. Store the connector's OAuth access token as a secret.
+echo -n "<google-drive-oauth-access-token>" | gcloud secrets create duet-drive-auth \
+    --data-file=- --replication-policy=automatic --project=asc-router
+
+# 2. Redeploy with the connector id + the two case folder ids.
+pwsh ./server/deploy.ps1 -DriveConnectorId connector_googledrive `
+    -DriveFolderIds "<federal-court-appeal-folder-id>,<supreme-court-case-folder-id>"
+```
+
+`duet_health` then reports `"responses_api": true` and `"drive_connector": true`.
+
+**Scoping (important).** The Drive connector uses the `drive.readonly` OAuth scope,
+which is **all-or-nothing** — it can read everything the authorized Google account can
+see, and there is **no connector setting that limits it to specific folders**. To keep
+GPT to just the two case folders, authorize a **dedicated Google account or restricted
+shared drive** that only has those folders shared to it. `DUET_DRIVE_FOLDER_IDS` is only
+a prompt hint, **not** a security boundary. When the connector is not configured, GPT
+falls back to `request_document` (you resolve those as today). The OpenAI connector
+field names are env-overridable (`DUET_DRIVE_*`) for forward-compatibility with API
+changes.
+
 ## 3. Upload the portable skill (recommended) — gives duet in chat + cowork
 
 claude.ai supports custom skills in **chat and Cowork**. Upload this skill:

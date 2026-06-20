@@ -1,5 +1,8 @@
 fastmcp>=0.4.0
-openai>=1.40.0
+# Responses API + hosted Google Drive connector tool. Connector support for MCP tools landed
+# in openai 1.101.0 (Aug 2025); 2.x is the current line. >=1.101.0 is the hard floor for
+# DUET_USE_RESPONSES_API=1; >=2.43.0 recommended for a current deploy.
+openai>=1.101.0
 anthropic>=0.40.0
 pydantic>=2.6.0
 python-dotenv>=1.0.0

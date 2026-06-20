@@ -24,13 +24,27 @@
 
 .PARAMETER PartnerModel
     Defaults to gpt-5.5.
+
+.PARAMETER DriveConnectorId
+    OpenAI Google Drive connector id (e.g. connector_googledrive). When supplied,
+    the deploy enables the Responses-API path (DUET_USE_RESPONSES_API=1) so the GPT
+    side reads the case folders from Drive itself. Requires the OAuth token stored in
+    Secret Manager as `duet-drive-auth`. Omit to deploy without live Drive (default).
+
+.PARAMETER DriveFolderIds
+    Comma-separated Drive folder ids for the case folders, surfaced to GPT as a hint only.
+    This is NOT a security boundary: drive.readonly is all-or-nothing, so real least-
+    privilege requires a dedicated Google account / restricted shared drive that can only
+    see those folders.
 #>
 [CmdletBinding()]
 param(
     [string]$Project,
-    [string]$Region       = 'australia-southeast1',
-    [string]$ServiceName  = 'duet-bridge',
-    [string]$PartnerModel = 'gpt-5.5'
+    [string]$Region          = 'australia-southeast1',
+    [string]$ServiceName     = 'duet-bridge',
+    [string]$PartnerModel    = 'gpt-5.5',
+    [string]$DriveConnectorId = '',
+    [string]$DriveFolderIds   = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -162,6 +176,44 @@ if ($anthropicExists) {
     Write-Output "  echo -n '<key>' | gcloud secrets create $anthropicSecretName --data-file=- --replication-policy=automatic --project=$Project"
 }
 
+# Base environment. Live Google Drive (the Responses-API path) is OFF unless a Drive
+# connector id is passed; the base deploy is byte-for-byte the prior behaviour.
+$envVars = "OPENAI_PARTNER_MODEL=$PartnerModel,DUET_TRANSPORT=http,DUET_STATE_DIR=/tmp/duet-state,DUET_ITERATION_CAP=8,DUET_CONFIDENCE_THRESHOLD=95,DUET_OPUS_MODEL=claude-opus-4-8,DUET_OPENAI_TIMEOUT=150,DUET_MAX_OUTPUT_TOKENS=4000,DUET_OUTPUT_TOKEN_PARAM=max_completion_tokens,DUET_MAX_TOTAL_DOC_CHARS=120000"
+
+if ($DriveConnectorId) {
+    $driveSecretName = 'duet-drive-auth'
+    $driveExists = $false
+    try {
+        $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = 0
+        & gcloud secrets describe $driveSecretName --project $Project 2>&1 | Out-Null
+        $driveExists = ($LASTEXITCODE -eq 0)
+    } catch {
+        $driveExists = $false
+    } finally {
+        $ErrorActionPreference = 'Stop'
+    }
+    if (-not $driveExists) {
+        throw ("DriveConnectorId was supplied but secret $driveSecretName is missing. Create it first:`n" +
+            "  echo -n '<oauth-access-token>' | gcloud secrets create $driveSecretName --data-file=- --replication-policy=automatic --project=$Project")
+    }
+    Write-Output "Drive connector '$DriveConnectorId' configured; enabling live Drive (Responses API)."
+    $envVars += ",DUET_USE_RESPONSES_API=1,DUET_DRIVE_CONNECTOR_ID=$DriveConnectorId"
+    if ($DriveFolderIds) { $envVars += ",DUET_DRIVE_FOLDER_IDS=$DriveFolderIds" }
+    $secretMap += ",DUET_DRIVE_AUTH=$($driveSecretName):latest"
+    $projNum = (& gcloud projects describe $Project --format 'value(projectNumber)' 2>$null)
+    if ($projNum) {
+        $runtimeSa = "$projNum-compute@developer.gserviceaccount.com"
+        Write-Output "Ensuring $runtimeSa can access $driveSecretName..."
+        Invoke-Gcloud secrets add-iam-policy-binding $driveSecretName `
+            --member "serviceAccount:$runtimeSa" `
+            --role roles/secretmanager.secretAccessor `
+            --project $Project | Out-Null
+    }
+} else {
+    Write-Output "No DriveConnectorId; deploying without live Drive (GPT falls back to request_document)."
+}
+
 $srcDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 Write-Output 'Deploying to Cloud Run...'
@@ -171,7 +223,7 @@ Invoke-Gcloud run deploy $ServiceName `
     --region $Region `
     --project $Project `
     --allow-unauthenticated `
-    --set-env-vars "OPENAI_PARTNER_MODEL=$PartnerModel,DUET_TRANSPORT=http,DUET_STATE_DIR=/tmp/duet-state,DUET_ITERATION_CAP=8,DUET_CONFIDENCE_THRESHOLD=95,DUET_OPUS_MODEL=claude-opus-4-8,DUET_OPENAI_TIMEOUT=150,DUET_MAX_OUTPUT_TOKENS=4000,DUET_OUTPUT_TOKEN_PARAM=max_completion_tokens,DUET_MAX_TOTAL_DOC_CHARS=120000" `
+    --set-env-vars $envVars `
     --set-secrets $secretMap `
     --memory 512Mi `
     --cpu 1 `

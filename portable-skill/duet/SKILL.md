@@ -49,6 +49,16 @@ mobile chat — anywhere you can call the connector tools.
      `available_documents` (a list of `{name, description?, source?}`) to advertise a
      catalog GPT can pull from on demand via `request_document`. Extract text from
      binary formats (PDF/DOCX) before sending. Document content is sent to GPT/OpenAI.
+   - **Inject the matter + case-folder catalogue.** For a legal matter, pass
+     `project_name` (the matter name) and `folder_catalogue` — a manifest of the case
+     Drive folders, e.g. `[{folder_name: "Federal Court Appeal", folder_id?, files:
+     [{name, file_id?, mime?}]}, {folder_name: "Supreme Court Case", ...}]` — on
+     **every** turn (critic AND verifier), so GPT knows which matter the request relates
+     to and what the record contains. Only the *listing* is sent, not the file bytes.
+     When the bridge runs with live Drive (`DUET_USE_RESPONSES_API` + a configured Drive
+     connector), GPT opens the listed files from Drive itself and reviews the case to
+     understand the matter *before* scoring your candidate — you do **not** push their
+     full text. If live Drive is unavailable, GPT falls back to `request_document`.
 4. **Check acceptance** (see rule below). If accepted → go to verify.
 5. **Revise as Opus.** Otherwise, produce `cand-(n+1)` that resolves every open
    blocker/major/moderate item; re-score yourself. Loop back to step 3 with the
@@ -91,6 +101,11 @@ successive requests until the turn returns `status: "final"`. Branch on
   so GPT can pick another or proceed. This is the two-way, multi-step exchange: GPT
   may request several documents in succession (e.g. a vault file, then a referenced
   exhibit) before delivering its critique. Document content is sent to GPT/OpenAI.
+- **Google Drive (live)** — when the bridge has a Drive connector configured, GPT reads
+  the catalogued case files *inside its own runtime*; those reads are resolved by OpenAI
+  and do **NOT** come back to you as `tool_request`. Only `claude_slash_command` and
+  `request_document` suspend the turn for you to resolve. Case content read this way is
+  sent to GPT/OpenAI directly from Drive.
 
 ### Large documents & the time budget
 The GPT critique runs inside one tool call, and the MCP client caps tool calls at

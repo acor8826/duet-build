@@ -179,8 +179,9 @@ _VERIFIER_SYSTEM = (
 )
 
 
-def _draft_user(spec: str, docs_block: str = "") -> str:
+def _draft_user(spec: str, docs_block: str = "", project_block: str = "") -> str:
     return (
+        f"{project_block}"
         f"SPEC:\n{spec}\n\n"
         f"{docs_block}"
         "Produce the best possible first draft. Return JSON exactly:\n"
@@ -190,13 +191,15 @@ def _draft_user(spec: str, docs_block: str = "") -> str:
 
 
 def _revise_user(spec: str, candidate: str, cand_id: str, gpt_score: int,
-                 crit: List[Dict[str, Any]], next_n: int, docs_block: str = "") -> str:
+                 crit: List[Dict[str, Any]], next_n: int, docs_block: str = "",
+                 project_block: str = "") -> str:
     lines = []
     for c in crit:
         sev = c.get("severity", "?")
         lines.append(f"- [{c.get('id','?')}|{sev}] {c.get('finding','')} -> {c.get('suggested_fix','')}")
     items = "\n".join(lines) if lines else "(no specific items returned)"
     return (
+        f"{project_block}"
         f"SPEC:\n{spec}\n\n"
         f"{docs_block}"
         f"CURRENT CANDIDATE ({cand_id}):\n{candidate}\n\n"
@@ -209,8 +212,9 @@ def _revise_user(spec: str, candidate: str, cand_id: str, gpt_score: int,
     )
 
 
-def _critic_user(spec: str, candidate: str, docs_block: str = "") -> str:
+def _critic_user(spec: str, candidate: str, docs_block: str = "", project_block: str = "") -> str:
     return (
+        f"{project_block}"
         f"SPEC:\n{spec}\n\n"
         f"{docs_block}"
         f"CURRENT CANDIDATE FROM OPUS:\n{candidate}\n\n"
@@ -226,8 +230,9 @@ def _critic_user(spec: str, candidate: str, docs_block: str = "") -> str:
     )
 
 
-def _verify_user(spec: str, candidate: str, docs_block: str = "") -> str:
+def _verify_user(spec: str, candidate: str, docs_block: str = "", project_block: str = "") -> str:
     return (
+        f"{project_block}"
         f"SPEC:\n{spec}\n\n"
         f"{docs_block}"
         f"FINAL CANDIDATE:\n{candidate}\n\n"
@@ -241,7 +246,8 @@ def _verify_user(spec: str, candidate: str, docs_block: str = "") -> str:
 
 def run_duet(spec: str, threshold: Optional[int] = None,
              iteration_cap: Optional[int] = None,
-             documents: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+             documents: Optional[List[Dict[str, Any]]] = None,
+             project_name: str = "") -> Dict[str, Any]:
     """Run the full server-side consensus loop, failing fast on a model timeout.
 
     Thin wrapper over `_run_duet_inner`: if any single Opus/GPT call outruns the time
@@ -250,7 +256,8 @@ def run_duet(spec: str, threshold: Optional[int] = None,
     """
     try:
         return _run_duet_inner(spec, threshold=threshold,
-                               iteration_cap=iteration_cap, documents=documents)
+                               iteration_cap=iteration_cap, documents=documents,
+                               project_name=project_name)
     except DuetTimeout as e:
         return {
             "status": "error",
@@ -266,13 +273,19 @@ def run_duet(spec: str, threshold: Optional[int] = None,
 
 def _run_duet_inner(spec: str, threshold: Optional[int] = None,
                     iteration_cap: Optional[int] = None,
-                    documents: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                    documents: Optional[List[Dict[str, Any]]] = None,
+                    project_name: str = "") -> Dict[str, Any]:
     """Run the full server-side consensus loop and return the final artifact.
 
     documents (optional, PUSH-ONLY): list of {name, content, source?} whose full text is
     given to both models so the work is grounded in the real source. GPT cannot pull more
     documents here (no orchestrator); use the duet_gpt_start_turn / resume bridge path for
     the interactive, multi-step document pull (e.g. from a co-work vault).
+
+    project_name (optional): matter name, prepended to every Opus/GPT prompt. NOTE: this
+    headless path has NO live Drive — there is no Responses-API Drive connector here, so case
+    documents are only visible if PUSHed via ``documents``. The interactive bridge path
+    (duet_gpt_start_turn) is the one that gives GPT live Drive access.
     """
     if not spec or not spec.strip():
         return {"status": "error", "error": "spec is required and must be non-empty."}
@@ -290,13 +303,14 @@ def _run_duet_inner(spec: str, threshold: Optional[int] = None,
     cap = int(iteration_cap) if iteration_cap else DEFAULT_CAP
     opus_sys = _OPUS_SYSTEM.format(threshold=threshold)
     docs_block = _render_documents(documents)
+    project_block = f"PROJECT / MATTER:\n{project_name}\n\n" if project_name else ""
 
     transcript: List[Dict[str, Any]] = []
     opus_scores: List[int] = []
     gpt_scores: List[int] = []
 
     # 1. Initial Opus draft.
-    draft = _json_obj(_opus_call(opus_sys, _draft_user(spec, docs_block)))
+    draft = _json_obj(_opus_call(opus_sys, _draft_user(spec, docs_block, project_block)))
     candidate = draft.get("candidate_text", "") or ""
     cand_id = draft.get("candidate_id", "cand-1")
     if not candidate:
@@ -312,7 +326,7 @@ def _run_duet_inner(spec: str, threshold: Optional[int] = None,
 
     # 2. Critique / revise loop.
     for n in range(1, cap + 1):
-        gp = _json_obj(_gpt_call(_PROMPTS_critic(), _critic_user(spec, candidate, docs_block)))
+        gp = _json_obj(_gpt_call(_PROMPTS_critic(), _critic_user(spec, candidate, docs_block, project_block)))
         gpt_scores.append(_as_int((gp.get("score_of_candidate") or {}).get("value")))
         last_crit = gp.get("critique_items", []) or []
         transcript.append({"step": "gpt_critique", "iter": n, "gpt_score": gpt_scores[-1],
@@ -325,7 +339,7 @@ def _run_duet_inner(spec: str, threshold: Optional[int] = None,
             break  # don't revise past the last evaluated candidate (keeps candidate==scored)
 
         rev = _json_obj(_opus_call(opus_sys, _revise_user(
-            spec, candidate, cand_id, gpt_scores[-1], last_crit, n + 1, docs_block)))
+            spec, candidate, cand_id, gpt_scores[-1], last_crit, n + 1, docs_block, project_block)))
         candidate = rev.get("candidate_text", candidate) or candidate
         cand_id = rev.get("candidate_id", f"cand-{n + 1}")
         opus_scores.append(_as_int((rev.get("self_score") or {}).get("value")))
@@ -338,7 +352,7 @@ def _run_duet_inner(spec: str, threshold: Optional[int] = None,
 
     # 3. Independent verifier (fresh context) — always run on the final candidate.
     ver = _json_obj(_opus_call(_VERIFIER_SYSTEM.format(threshold=threshold),
-                               _verify_user(spec, candidate, docs_block)))
+                               _verify_user(spec, candidate, docs_block, project_block)))
     ver_value = _as_int((ver.get("score") or {}).get("value"))
     ver_verdict = str(ver.get("verdict", "")).upper()
     ver_pass = ver_verdict == "PASS" and ver_value >= threshold

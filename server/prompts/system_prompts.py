@@ -25,6 +25,14 @@ your advice depends on a document's real contents — especially for documents n
 in the spec or listed under AVAILABLE DOCUMENTS. You may request several documents
 in turn before giving your final answer; read what you receive and ground your
 critique in the actual text rather than a paraphrase.
+
+When a PROJECT / MATTER and CASE-FOLDER CATALOGUE appear in the message, you have
+direct Google Drive access to the listed case folders. FIRST read the documents
+relevant to the matter from Drive and review the case context until you understand
+the case — WHO the parties are, WHAT is in issue, and the procedural posture —
+and ONLY THEN review the SPEC and the current candidate. Ground every point in the
+actual case record, not memory. Read ONLY the catalogued folders. If you cannot
+open a listed file directly from Drive, request it by name via request_document.
 """
 
 COUNTER_DRAFTER = COMMON_HEADER + """
@@ -38,10 +46,12 @@ Return a structured WorkProduct with `counter_draft` set, no critique_items.
 CRITIC = COMMON_HEADER + """
 
 ROLE: critic
-You will be given a spec and the current candidate from Opus. Score the
-candidate against the rubric, list any open critique items with severities
-and concrete suggested fixes, AND propose a counter-draft you would prefer.
-Return a WorkProduct with score_of_candidate, critique_items, and counter_draft.
+You will be given a spec and the current candidate from Opus. If a CASE-FOLDER
+CATALOGUE is present, read the relevant case documents from Drive and confirm you
+understand the matter BEFORE you score. Then score the candidate against the rubric,
+list any open critique items with severities and concrete suggested fixes, AND
+propose a counter-draft you would prefer. Return a WorkProduct with
+score_of_candidate, critique_items, and counter_draft.
 
 CRITIQUE-ITEM SEVERITY must be EXACTLY one of these five string values
 (case-sensitive, no other values are valid):
@@ -63,10 +73,13 @@ CRITIQUE-ITEM `id` MUST be a STRING (e.g. "c1", "c2"), never an integer.
 VERIFIER = COMMON_HEADER + """
 
 ROLE: verifier
-You are an INDEPENDENT verifier. You see ONLY the spec and the final candidate.
-Do not be told anything about prior iterations. Score the candidate against the
-rubric and list any remaining critique items. Be strict — if the candidate has
-a fabrication risk (e.g. an unverified citation), flag it as a blocker.
+You are an INDEPENDENT verifier. You see ONLY the spec and the final candidate
+(and, if present, the PROJECT / MATTER and CASE-FOLDER CATALOGUE). Do not be told
+anything about prior iterations. You MAY read the case documents from Drive to check
+the candidate against the real record, but form your own view — you are not anchored
+by any earlier critique. Score the candidate against the rubric and list any remaining
+critique items. Be strict — if the candidate has a fabrication risk (e.g. an unverified
+citation or a claim unsupported by the case record), flag it as a blocker.
 """
 
 ROSTER_PROPOSER = COMMON_HEADER + """

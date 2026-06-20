@@ -35,6 +35,13 @@ class Session:
     documents: List[Dict[str, Any]] = field(default_factory=list)  # full text pushed to GPT at start
     available_documents: List[Dict[str, Any]] = field(default_factory=list)  # catalog GPT may pull from
     doc_requests_made: int = 0  # count of request_document tool calls this turn (budget guard)
+    # Case/matter grounding. project_name + folder_catalogue are injected into the user
+    # message every turn so GPT knows which matter the request relates to and what the
+    # case record contains; with live Drive (Responses API) GPT reads the listed files
+    # itself. All default-valued so older on-disk session JSON still loads via cls(**d).
+    project_name: str = ""  # e.g. "Smith v Commonwealth"
+    folder_catalogue: List[Dict[str, Any]] = field(default_factory=list)  # [{folder_name, folder_id?, files:[{name,file_id?,mime?}]}]
+    last_response_id: Optional[str] = None  # Responses-API chaining handle (previous_response_id)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
