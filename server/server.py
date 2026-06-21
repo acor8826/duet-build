@@ -50,6 +50,11 @@ DUET_OPENAI_TIMEOUT = float(os.environ.get("DUET_OPENAI_TIMEOUT", "150"))  # sec
 DUET_OPENAI_MAX_RETRIES = int(os.environ.get("DUET_OPENAI_MAX_RETRIES", "0"))  # SDK retries would multiply wall-clock
 DUET_MAX_OUTPUT_TOKENS = int(os.environ.get("DUET_MAX_OUTPUT_TOKENS", "4000"))  # cap response generation
 DUET_OUTPUT_TOKEN_PARAM = os.environ.get("DUET_OUTPUT_TOKEN_PARAM", "max_tokens")  # or "max_completion_tokens"
+# GPT-side reasoning effort ("extended thinking"). Empty => unset (current behaviour, default
+# effort). When set (e.g. "low"/"medium"/"high"), it is sent as reasoning_effort on the chat
+# path and as reasoning={"effort": ...} on the Responses path. Only valid for reasoning models;
+# higher effort costs more time/tokens, so mind the ~180s client cap (DUET_OPENAI_TIMEOUT).
+DUET_GPT_REASONING_EFFORT = os.environ.get("DUET_GPT_REASONING_EFFORT", "").strip()
 DUET_MAX_TOTAL_DOC_CHARS = int(os.environ.get("DUET_MAX_TOTAL_DOC_CHARS", "120000"))  # cumulative pushed-doc cap
 
 # Live Google Drive for the GPT side. When DUET_USE_RESPONSES_API is on, the bridge calls
@@ -371,6 +376,8 @@ def _run_openai_loop(session: Session) -> Dict[str, Any]:
             }
         # Bound the response so generation can't run past the client window.
         call_kwargs[DUET_OUTPUT_TOKEN_PARAM] = DUET_MAX_OUTPUT_TOKENS
+        if DUET_GPT_REASONING_EFFORT:
+            call_kwargs["reasoning_effort"] = DUET_GPT_REASONING_EFFORT
         try:
             resp = client.chat.completions.create(
                 model=MODEL,
@@ -509,6 +516,8 @@ def _run_responses_loop(session: Session) -> Dict[str, Any]:
         "parallel_tool_calls": False,
         "max_output_tokens": DUET_MAX_OUTPUT_TOKENS,
     }
+    if DUET_GPT_REASONING_EFFORT:
+        call_kwargs["reasoning"] = {"effort": DUET_GPT_REASONING_EFFORT}
     if session.doc_requests_made < DUET_MAX_DOC_REQUESTS:
         call_kwargs["tool_choice"] = "auto"
     else:

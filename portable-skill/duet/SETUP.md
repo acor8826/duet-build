@@ -88,6 +88,20 @@ falls back to `request_document` (you resolve those as today). The OpenAI connec
 field names are env-overridable (`DUET_DRIVE_*`) for forward-compatibility with API
 changes.
 
+## 2c. (OPTIONAL) Turn up GPT reasoning ("extended thinking")
+
+There is no separate "GPT-5.5 Pro" API model — `gpt-5.5` IS the reasoning model, and it
+already runs at **medium** reasoning effort by default. To make it think harder, set the
+effort to `high` or `xhigh` (valid: `none|low|medium|high|xhigh`):
+
+```
+pwsh ./server/deploy.ps1 -GptReasoningEffort high
+```
+
+This sends `reasoning_effort` on the chat path and `reasoning={"effort": …}` on the
+Responses path. Higher effort costs more latency/tokens, so mind the ~180s client tool-call
+cap. Omit the flag to keep the model default (medium).
+
 ## 3. Upload the portable skill (recommended) — gives duet in chat + cowork
 
 claude.ai supports custom skills in **chat and Cowork**. Upload this skill:

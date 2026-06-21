@@ -49,6 +49,7 @@ OPENAI_TIMEOUT = float(os.environ.get("DUET_OPENAI_TIMEOUT", "150"))  # per-call
 OPENAI_MAX_RETRIES = int(os.environ.get("DUET_OPENAI_MAX_RETRIES", "0"))
 MAX_OUTPUT_TOKENS = int(os.environ.get("DUET_MAX_OUTPUT_TOKENS", "4000"))
 OUTPUT_TOKEN_PARAM = os.environ.get("DUET_OUTPUT_TOKEN_PARAM", "max_tokens")
+GPT_REASONING_EFFORT = os.environ.get("DUET_GPT_REASONING_EFFORT", "").strip()  # "" => model default
 
 
 class DuetTimeout(Exception):
@@ -145,12 +146,15 @@ def _gpt_call(system: str, user: str) -> str:
         timeout=OPENAI_TIMEOUT,
         max_retries=OPENAI_MAX_RETRIES,
     )
+    extra = {OUTPUT_TOKEN_PARAM: MAX_OUTPUT_TOKENS}
+    if GPT_REASONING_EFFORT:
+        extra["reasoning_effort"] = GPT_REASONING_EFFORT
     try:
         resp = client.chat.completions.create(
             model=GPT_MODEL,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             response_format={"type": "json_object"},
-            **{OUTPUT_TOKEN_PARAM: MAX_OUTPUT_TOKENS},
+            **extra,
         )
     except Exception as e:
         if _is_timeout_error(e):

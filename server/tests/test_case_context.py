@@ -251,5 +251,35 @@ class ResponsesLoop(unittest.TestCase):
             srv.DUET_USE_RESPONSES_API, srv._openai_client = orig_flag, orig_client
 
 
+class ReasoningEffort(unittest.TestCase):
+    def _run(self, responses_api: bool, effort: str):
+        orig = (srv.DUET_USE_RESPONSES_API, srv.DUET_GPT_REASONING_EFFORT, srv._openai_client)
+        srv.DUET_USE_RESPONSES_API = responses_api
+        srv.DUET_GPT_REASONING_EFFORT = effort
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                srv._STORE = srv.SessionStore(td)
+                fake = _RespClient([_final_resp(96)]) if responses_api else _ChatClient([_final_chat_msg(96)])
+                srv._openai_client = lambda: fake
+                srv._start_turn_impl(None, "critic", "spec", "draft", "")
+                return (fake.responses.call_kwargs[0] if responses_api
+                        else fake.chat.completions.call_kwargs[0])
+        finally:
+            srv.DUET_USE_RESPONSES_API, srv.DUET_GPT_REASONING_EFFORT, srv._openai_client = orig
+
+    def test_chat_path_sends_reasoning_effort(self) -> None:
+        kw = self._run(responses_api=False, effort="high")
+        self.assertEqual(kw["reasoning_effort"], "high")
+
+    def test_responses_path_sends_reasoning_object(self) -> None:
+        kw = self._run(responses_api=True, effort="xhigh")
+        self.assertEqual(kw["reasoning"], {"effort": "xhigh"})
+
+    def test_unset_sends_no_reasoning(self) -> None:
+        kw = self._run(responses_api=False, effort="")
+        self.assertNotIn("reasoning_effort", kw)
+        self.assertNotIn("reasoning", kw)
+
+
 if __name__ == "__main__":
     unittest.main()

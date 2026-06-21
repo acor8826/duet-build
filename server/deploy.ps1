@@ -36,6 +36,11 @@
     This is NOT a security boundary: drive.readonly is all-or-nothing, so real least-
     privilege requires a dedicated Google account / restricted shared drive that can only
     see those folders.
+
+.PARAMETER GptReasoningEffort
+    GPT-side reasoning effort ("extended thinking"): none | low | medium | high | xhigh.
+    gpt-5.5 already defaults to medium; pass high/xhigh for deeper reasoning (more
+    latency/cost — mind the ~180s client cap). Omit to leave the model default.
 #>
 [CmdletBinding()]
 param(
@@ -44,7 +49,8 @@ param(
     [string]$ServiceName     = 'duet-bridge',
     [string]$PartnerModel    = 'gpt-5.5',
     [string]$DriveConnectorId = '',
-    [string]$DriveFolderIds   = ''
+    [string]$DriveFolderIds   = '',
+    [string]$GptReasoningEffort = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -179,6 +185,11 @@ if ($anthropicExists) {
 # Base environment. Live Google Drive (the Responses-API path) is OFF unless a Drive
 # connector id is passed; the base deploy is byte-for-byte the prior behaviour.
 $envVars = "OPENAI_PARTNER_MODEL=$PartnerModel,DUET_TRANSPORT=http,DUET_STATE_DIR=/tmp/duet-state,DUET_ITERATION_CAP=8,DUET_CONFIDENCE_THRESHOLD=95,DUET_OPUS_MODEL=claude-opus-4-8,DUET_OPENAI_TIMEOUT=150,DUET_MAX_OUTPUT_TOKENS=4000,DUET_OUTPUT_TOKEN_PARAM=max_completion_tokens,DUET_MAX_TOTAL_DOC_CHARS=120000"
+
+if ($GptReasoningEffort) {
+    Write-Output "GPT reasoning effort set to '$GptReasoningEffort'."
+    $envVars += ",DUET_GPT_REASONING_EFFORT=$GptReasoningEffort"
+}
 
 if ($DriveConnectorId) {
     $driveSecretName = 'duet-drive-auth'
