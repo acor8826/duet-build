@@ -51,6 +51,12 @@ DUET_OPENAI_MAX_RETRIES = int(os.environ.get("DUET_OPENAI_MAX_RETRIES", "0"))  #
 DUET_MAX_OUTPUT_TOKENS = int(os.environ.get("DUET_MAX_OUTPUT_TOKENS", "4000"))  # cap response generation
 DUET_OUTPUT_TOKEN_PARAM = os.environ.get("DUET_OUTPUT_TOKEN_PARAM", "max_tokens")  # or "max_completion_tokens"
 DUET_MAX_TOTAL_DOC_CHARS = int(os.environ.get("DUET_MAX_TOTAL_DOC_CHARS", "120000"))  # cumulative pushed-doc cap
+# gpt-5.6 rejects chat.completions requests that combine function tools with an
+# active reasoning effort (HTTP 400: "use /v1/responses or set reasoning_effort to
+# 'none'"), and the API default effort is active. Tool-bearing calls therefore pin
+# reasoning off. Set empty to omit the param (models that reject it), or a level if
+# a future model supports tools+reasoning on this endpoint.
+DUET_GPT_REASONING_EFFORT = os.environ.get("DUET_GPT_REASONING_EFFORT", "none")
 
 # Below this candidate size the payload is "small" and gets no concise-critique nudge.
 _CONCISE_NUDGE_CANDIDATE_CHARS = 8000
@@ -269,6 +275,8 @@ def _run_openai_loop(session: Session) -> Dict[str, Any]:
             }
         # Bound the response so generation can't run past the client window.
         call_kwargs[DUET_OUTPUT_TOKEN_PARAM] = DUET_MAX_OUTPUT_TOKENS
+        if DUET_GPT_REASONING_EFFORT:
+            call_kwargs["reasoning_effort"] = DUET_GPT_REASONING_EFFORT
         try:
             resp = client.chat.completions.create(
                 model=MODEL,

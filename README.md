@@ -273,6 +273,7 @@ connector — no need to remove and re-add).
 | `DUET_CONFIDENCE_THRESHOLD` | `95`                                         | Min score (both models) required to converge.            |
 | `DUET_MAX_DOC_CHARS`        | `100000`                                     | Per-document content cap (push + pull); longer text is truncated and marked. |
 | `DUET_MAX_DOC_REQUESTS`     | `4`                                          | Max `request_document` pulls GPT may make per turn before the bridge forces a final. |
+| `DUET_GPT_REASONING_EFFORT` | `none`                                       | Sent as `reasoning_effort` on tool-bearing GPT calls — gpt-5.6 rejects tools+active reasoning on chat.completions. Empty = omit the param. |
 | `DUET_TRANSPORT`            | `stdio`                                      | `stdio` (local MCP) or `http` (Cloud Run).               |
 | `DUET_STATE_DIR`            | `C:\Users\acor8\.claude\duet` / `/tmp/duet-state` | Session + lock directory.                          |
 | `PORT`                      | `8080`                                       | HTTP port (Cloud Run only).                              |
