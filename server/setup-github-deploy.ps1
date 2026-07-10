@@ -100,12 +100,15 @@ if (-not (Test-GcloudResource @('iam', 'service-accounts', 'describe', $saEmail,
 #   run.admin                       deploy/update the Cloud Run service
 #   cloudbuild.builds.editor        --source deploys submit a Cloud Build
 #   storage.admin                   upload source tarball to the build bucket
+#   artifactregistry.writer         source deploys push the built image to the
+#                                   cloud-run-source-deploy repo
 #   secretmanager.viewer            the workflow probes for duet-anthropic-key
 #   serviceusage.serviceUsageConsumer  quota/project API usage during build
 foreach ($role in @(
         'roles/run.admin',
         'roles/cloudbuild.builds.editor',
         'roles/storage.admin',
+        'roles/artifactregistry.writer',
         'roles/secretmanager.viewer',
         'roles/serviceusage.serviceUsageConsumer')) {
     Write-Output "Granting $role..."
