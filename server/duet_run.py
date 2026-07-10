@@ -36,7 +36,7 @@ from rubric import acceptance_check  # reuse the canonical two-gate acceptance r
 from jsonutil import _json_obj  # tolerant JSON extraction (shared with server.py)
 
 OPUS_MODEL = os.environ.get("DUET_OPUS_MODEL", "claude-opus-4-8")
-GPT_MODEL = os.environ.get("OPENAI_PARTNER_MODEL", "gpt-5.5")
+GPT_MODEL = os.environ.get("OPENAI_PARTNER_MODEL", "gpt-5.6")
 DEFAULT_THRESHOLD = int(os.environ.get("DUET_CONFIDENCE_THRESHOLD", "95"))
 DEFAULT_CAP = int(os.environ.get("DUET_ITERATION_CAP", "8"))
 MAX_DOC_CHARS = int(os.environ.get("DUET_MAX_DOC_CHARS", "100000"))  # per-document content cap (push)
@@ -163,7 +163,7 @@ def _gpt_call(system: str, user: str) -> str:
 
 _OPUS_SYSTEM = (
     "You are Claude Opus 4.8, the lead author in a two-model consensus system called "
-    "\"duet\", collaborating with OpenAI GPT-5.5. You draft and iteratively improve a "
+    "\"duet\", collaborating with OpenAI GPT-5.6. You draft and iteratively improve a "
     "deliverable until both models independently score the same candidate at or above "
     "{threshold}/100 against the rubric (accuracy, completeness, clarity, rigour, "
     "fitness-for-purpose). Be rigorous and genuinely self-critical — do not inflate your "
@@ -200,7 +200,7 @@ def _revise_user(spec: str, candidate: str, cand_id: str, gpt_score: int,
         f"SPEC:\n{spec}\n\n"
         f"{docs_block}"
         f"CURRENT CANDIDATE ({cand_id}):\n{candidate}\n\n"
-        f"GPT-5.5 scored this candidate {gpt_score}/100 and raised these critique items:\n{items}\n\n"
+        f"GPT-5.6 scored this candidate {gpt_score}/100 and raised these critique items:\n{items}\n\n"
         "Revise the artifact to resolve EVERY blocker/major/moderate item (minor/nit are optional). "
         "Do not regress on points already correct. Return JSON exactly:\n"
         f'{{"candidate_id":"cand-{next_n}","candidate_text":"<the full revised artifact>",'

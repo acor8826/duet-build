@@ -1,14 +1,14 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "duet-marketplace",
-  "description": "Two-model consensus (duet): Claude Opus 4.8 and OpenAI GPT-5.5 iterate to consensus via the duet-bridge connector.",
+  "description": "Two-model consensus (duet): Claude Opus 4.8 and OpenAI GPT-5.6 iterate to consensus via the duet-bridge connector.",
   "owner": {
     "name": "acor8826"
   },
   "plugins": [
     {
       "name": "duet",
-      "description": "Two-model consensus collaboration. Ships the /duet slash command plus an auto-triggering skill: Claude Opus 4.8 drafts, OpenAI GPT-5.5 (via the duet-bridge connector) critiques and scores, they iterate to consensus, then an independent verifier signs off. Packaged as a plugin so /duet resolves through the command resolver (unaffected by the personal-skill marketplace-catalog resolver bug).",
+      "description": "Two-model consensus collaboration. Ships the /duet slash command plus an auto-triggering skill: Claude Opus 4.8 drafts, OpenAI GPT-5.6 (via the duet-bridge connector) critiques and scores, they iterate to consensus, then an independent verifier signs off. Packaged as a plugin so /duet resolves through the command resolver (unaffected by the personal-skill marketplace-catalog resolver bug).",
       "source": "./duet",
       "category": "productivity"
     }
