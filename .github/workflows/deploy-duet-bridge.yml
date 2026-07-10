@@ -25,7 +25,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PROJECT: model-folio-475609-d1
+  # The live duet-bridge service lives in asc-router — NOT the ambient gcloud
+  # default project on the dev machine. Deploying elsewhere creates a second
+  # service with a different URL and the claude.ai connector keeps talking to
+  # the old one.
+  PROJECT: asc-router
   REGION: australia-southeast1
   SERVICE: duet-bridge
   PARTNER_MODEL: gpt-5.6

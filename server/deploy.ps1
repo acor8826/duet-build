@@ -14,7 +14,10 @@
     secretmanager.googleapis.com, cloudbuild.googleapis.com) before deploy.
 
 .PARAMETER Project
-    GCP project id. If omitted, uses `gcloud config get project`.
+    GCP project id. Defaults to asc-router — where the live duet-bridge
+    service runs. This is NOT the ambient `gcloud config` project on this
+    machine; deploying to the config default would create a second service
+    with a different URL while the claude.ai connector kept using the old one.
 
 .PARAMETER Region
     Defaults to australia-southeast1.
@@ -27,7 +30,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Project,
+    [string]$Project      = 'asc-router',
     [string]$Region       = 'australia-southeast1',
     [string]$ServiceName  = 'duet-bridge',
     [string]$PartnerModel = 'gpt-5.6'

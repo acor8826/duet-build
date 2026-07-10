@@ -13,14 +13,16 @@
     Idempotent: safe to re-run; existing resources are reused.
 
 .PARAMETER Project
-    GCP project id. Defaults to the active gcloud config value.
+    GCP project id. Defaults to asc-router — the project the live duet-bridge
+    service actually runs in, which is NOT the ambient gcloud config default
+    on this machine. Deliberately not read from gcloud config for that reason.
 
 .PARAMETER Repo
     GitHub repo (owner/name) allowed to impersonate the deployer SA.
 #>
 [CmdletBinding()]
 param(
-    [string]$Project,
+    [string]$Project    = 'asc-router',
     [string]$Repo       = 'acor8826/duet-build',
     [string]$PoolId     = 'github-pool',
     [string]$ProviderId = 'github-provider',
@@ -54,10 +56,7 @@ function Test-GcloudResource {
     return $ok
 }
 
-if (-not $Project) {
-    $Project = (& gcloud config get-value project 2>$null)
-    if (-not $Project -or $Project -eq '(unset)') { throw 'No GCP project id. Pass -Project or set gcloud config.' }
-}
+if (-not $Project) { throw 'No GCP project id. Pass -Project (the live service runs in asc-router).' }
 
 Write-Output "project=$Project repo=$Repo pool=$PoolId provider=$ProviderId sa=$SaName"
 
