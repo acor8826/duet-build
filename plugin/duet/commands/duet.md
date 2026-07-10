@@ -1,5 +1,5 @@
 ---
-description: Two-model consensus — Opus 4.8 drafts, GPT-5.5 critiques via the duet-bridge connector, iterate to consensus, independent verifier signs off.
+description: Two-model consensus — Opus 4.8 drafts, GPT-5.6 critiques via the duet-bridge connector, iterate to consensus, independent verifier signs off.
 argument-hint: <task / deliverable to bring to two-model consensus>
 ---
 
@@ -7,7 +7,7 @@ argument-hint: <task / deliverable to bring to two-model consensus>
 
 The user's task is in `$ARGUMENTS`. Drive a two-model consensus loop in which **you
 are the Opus side** (using this session — no extra API credits) and **OpenAI
-GPT-5.5** is reached through the **duet-bridge** MCP connector. If `$ARGUMENTS` is
+GPT-5.6** is reached through the **duet-bridge** MCP connector. If `$ARGUMENTS` is
 empty, use the current conversation context as the task, or ask the user for one
 sentence describing the deliverable.
 

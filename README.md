@@ -1,7 +1,7 @@
-# duet — Opus 4.8 ↔ GPT-5.5 consensus collaboration
+# duet — Opus 4.8 ↔ GPT-5.6 consensus collaboration
 
 `duet` is a Claude Code skill plus a Python FastMCP server that drives two-model
-consensus on a deliverable. Claude Opus 4.8 and OpenAI GPT-5.5 take turns
+consensus on a deliverable. Claude Opus 4.8 and OpenAI GPT-5.6 take turns
 drafting, critiquing, scoring, and counter-drafting against a shared rubric
 until **both** score the same candidate ≥ 95/100 with **zero** open critique
 items. An independent verifier subagent then signs off, and the user accepts
@@ -32,7 +32,7 @@ flowchart TB
     roster -->|G2 wait| user2["User approves roster"]
     user2 -->|approved| iter["ITERATE (1..cap)"]
     iter -->|tool req| bridge["FastMCP duet-bridge"]
-    bridge -->|chat.completions| gpt["GPT-5.5"]
+    bridge -->|chat.completions| gpt["GPT-5.6"]
     gpt -->|tool_call| bridge
     bridge -->|suspend| skill
     skill -->|Task /austlii-...| sub["Claude subagent"]
@@ -123,6 +123,24 @@ C:\Users\acor8\OneDrive\Desktop\Connectors\duet-build\
 
 Region `australia-southeast1`, service `duet-bridge`.
 
+### Via GitHub (default)
+
+Every push to `master` that touches `server/**` deploys automatically through
+[`.github/workflows/deploy-duet-bridge.yml`](.github/workflows/deploy-duet-bridge.yml),
+which authenticates keylessly via Workload Identity Federation and runs the
+same `gcloud run deploy --source` as the local script. One-time provisioning
+(creates the WIF pool/provider + `github-deployer` service account and sets
+the `GCP_WIF_PROVIDER` / `GCP_DEPLOYER_SA` repo variables):
+
+```powershell
+cd C:\Users\acor8\OneDrive\Desktop\Connectors\duet-build\server
+.\setup-github-deploy.ps1   # requires gcloud auth login + gh auth login
+```
+
+The workflow can also be run manually from the Actions tab (workflow_dispatch).
+
+### Via deploy.ps1 (local fallback)
+
 ```powershell
 cd C:\Users\acor8\OneDrive\Desktop\Connectors\duet-build\server
 .\deploy.ps1               # uses gcloud config get-value project if set
@@ -209,7 +227,7 @@ Custom connectors require a Pro / Team / Enterprise account.
 Expected JSON (roughly):
 
 ```json
-{"model": "gpt-5.5", "transport": "http", "state_dir": "/tmp/duet-state", "ok": true}
+{"model": "gpt-5.6", "transport": "http", "state_dir": "/tmp/duet-state", "ok": true}
 ```
 
 That confirms TLS, ingress, bearer middleware, FastMCP routing, and tool
@@ -250,7 +268,7 @@ connector — no need to remove and re-add).
 |-----------------------------|----------------------------------------------|----------------------------------------------------------|
 | `OPENAI_API_KEY`            | (none, required)                             | OpenAI auth — read at bridge boot.                       |
 | `DUET_MCP_BEARER`           | (none; required when `DUET_TRANSPORT=http`)  | Static bearer token gating the public Cloud Run endpoint. |
-| `OPENAI_PARTNER_MODEL`      | `gpt-5.5`                                    | Model id passed to chat.completions.                     |
+| `OPENAI_PARTNER_MODEL`      | `gpt-5.6`                                    | Model id passed to chat.completions.                     |
 | `DUET_ITERATION_CAP`        | `8`                                          | Max inner-loop iterations before ESCALATED.              |
 | `DUET_CONFIDENCE_THRESHOLD` | `95`                                         | Min score (both models) required to converge.            |
 | `DUET_MAX_DOC_CHARS`        | `100000`                                     | Per-document content cap (push + pull); longer text is truncated and marked. |

@@ -1,6 +1,6 @@
 """FastMCP bridge for the duet skill.
 
-Exposes four tools used by the Claude-side orchestrator to drive a GPT-5.5
+Exposes four tools used by the Claude-side orchestrator to drive a GPT-5.6
 conversation that can itself request Claude Code slash commands. The bridge
 implements the suspend-on-tool-call pattern: when GPT emits a tool_call, the
 bridge persists session state and returns `{status: "tool_request"}` to the
@@ -30,7 +30,7 @@ import duet_run as duet_run_mod  # noqa: E402  (aliased: the MCP tool below is n
 
 load_dotenv()
 
-MODEL = os.environ.get("OPENAI_PARTNER_MODEL", "gpt-5.5")
+MODEL = os.environ.get("OPENAI_PARTNER_MODEL", "gpt-5.6")
 STATE_DIR = os.environ.get("DUET_STATE_DIR", str(Path.home() / ".claude" / "duet"))
 TRANSPORT = os.environ.get("DUET_TRANSPORT", "stdio")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -522,7 +522,7 @@ if mcp is not None:
     ) -> Dict[str, Any]:
         """Run the FULL two-model consensus loop server-side and return the final artifact.
 
-        One call does the whole thing: Claude Opus 4.8 drafts, GPT-5.5 critiques and
+        One call does the whole thing: Claude Opus 4.8 drafts, GPT-5.6 critiques and
         scores, Opus revises, repeating until both models accept the same candidate
         (rubric.acceptance_check) or the iteration cap is hit, then an independent
         verifier (fresh context) signs off. Designed so any surface that can reach this

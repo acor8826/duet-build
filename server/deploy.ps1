@@ -23,14 +23,14 @@
     Defaults to duet-bridge.
 
 .PARAMETER PartnerModel
-    Defaults to gpt-5.5.
+    Defaults to gpt-5.6.
 #>
 [CmdletBinding()]
 param(
     [string]$Project,
     [string]$Region       = 'australia-southeast1',
     [string]$ServiceName  = 'duet-bridge',
-    [string]$PartnerModel = 'gpt-5.5'
+    [string]$PartnerModel = 'gpt-5.6'
 )
 
 $ErrorActionPreference = 'Stop'
