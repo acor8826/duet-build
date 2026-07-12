@@ -1,8 +1,8 @@
 """In-memory + on-disk session store for the duet bridge.
 
 Each GPT-side coroutine is keyed by session_id. The conversation history (OpenAI
-message list) and pending tool-call metadata is persisted after every step so a
-restart can resume mid-iteration.
+Responses-API input item list, reasoning items included) and pending tool-call
+metadata is persisted after every step so a restart can resume mid-iteration.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class Session:
     session_id: str
     role: str  # counter_drafter | critic | verifier | roster_proposer
     spec: str
-    history: List[Dict[str, Any]] = field(default_factory=list)  # OpenAI message list
+    history: List[Dict[str, Any]] = field(default_factory=list)  # Responses-API input item list
     pending_tool_use_id: Optional[str] = None
     pending_tool_name: Optional[str] = None
     pending_tool_args: Optional[Dict[str, Any]] = None

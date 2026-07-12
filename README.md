@@ -32,7 +32,7 @@ flowchart TB
     roster -->|G2 wait| user2["User approves roster"]
     user2 -->|approved| iter["ITERATE (1..cap)"]
     iter -->|tool req| bridge["FastMCP duet-bridge"]
-    bridge -->|chat.completions| gpt["GPT-5.6"]
+    bridge -->|responses API| gpt["GPT-5.6"]
     gpt -->|tool_call| bridge
     bridge -->|suspend| skill
     skill -->|Task /austlii-...| sub["Claude subagent"]
@@ -268,12 +268,12 @@ connector — no need to remove and re-add).
 |-----------------------------|----------------------------------------------|----------------------------------------------------------|
 | `OPENAI_API_KEY`            | (none, required)                             | OpenAI auth — read at bridge boot.                       |
 | `DUET_MCP_BEARER`           | (none; required when `DUET_TRANSPORT=http`)  | Static bearer token gating the public Cloud Run endpoint. |
-| `OPENAI_PARTNER_MODEL`      | `gpt-5.6`                                    | Model id passed to chat.completions.                     |
+| `OPENAI_PARTNER_MODEL`      | `gpt-5.6`                                    | Model id passed to the Responses API.                    |
 | `DUET_ITERATION_CAP`        | `8`                                          | Max inner-loop iterations before ESCALATED.              |
 | `DUET_CONFIDENCE_THRESHOLD` | `95`                                         | Min score (both models) required to converge.            |
 | `DUET_MAX_DOC_CHARS`        | `100000`                                     | Per-document content cap (push + pull); longer text is truncated and marked. |
 | `DUET_MAX_DOC_REQUESTS`     | `4`                                          | Max `request_document` pulls GPT may make per turn before the bridge forces a final. |
-| `DUET_GPT_REASONING_EFFORT` | `none`                                       | Sent as `reasoning_effort` on tool-bearing GPT calls — gpt-5.6 rejects tools+active reasoning on chat.completions. Empty = omit the param. |
+| `DUET_GPT_REASONING_EFFORT` | `medium`                                     | GPT reasoning effort. The Responses API supports tools + reasoning together, so reasoning is on by default. Empty = model default. |
 | `DUET_TRANSPORT`            | `stdio`                                      | `stdio` (local MCP) or `http` (Cloud Run).               |
 | `DUET_STATE_DIR`            | `C:\Users\acor8\.claude\duet` / `/tmp/duet-state` | Session + lock directory.                          |
 | `PORT`                      | `8080`                                       | HTTP port (Cloud Run only).                              |
@@ -379,8 +379,7 @@ bridge bounds the work and fails fast rather than overrunning silently:
 |---|---|---|
 | `DUET_OPENAI_TIMEOUT` | `150` | OpenAI request timeout in seconds — kept **below** the ~180s client cap. |
 | `DUET_OPENAI_MAX_RETRIES` | `0` | No SDK retry storms that would multiply wall-clock past the cap. |
-| `DUET_MAX_OUTPUT_TOKENS` | `4000` | Caps response generation (the dominant latency term). |
-| `DUET_OUTPUT_TOKEN_PARAM` | `max_tokens` | Param name for the cap; set to `max_completion_tokens` if the model requires it. |
+| `DUET_MAX_OUTPUT_TOKENS` | `8000` | Caps generation via `max_output_tokens` — on the Responses API this bounds reasoning + visible output together (hence higher than the old chat.completions default of 4000). |
 | `DUET_MAX_TOTAL_DOC_CHARS` | `120000` | **Cumulative** cap across all pushed docs in one call (the per-doc `DUET_MAX_DOC_CHARS` still applies). Over-budget docs are omitted with a `[N document(s) omitted …]` marker; GPT can still pull them via `request_document`. |
 
 If a call still outruns the budget the bridge returns, **inside the window**, a clean

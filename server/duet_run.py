@@ -47,8 +47,10 @@ MAX_DOC_CHARS = int(os.environ.get("DUET_MAX_DOC_CHARS", "100000"))  # per-docum
 # the headless fallback path), but a single hung call now fails fast and retriably.
 OPENAI_TIMEOUT = float(os.environ.get("DUET_OPENAI_TIMEOUT", "150"))  # per-call request timeout (s)
 OPENAI_MAX_RETRIES = int(os.environ.get("DUET_OPENAI_MAX_RETRIES", "0"))
-MAX_OUTPUT_TOKENS = int(os.environ.get("DUET_MAX_OUTPUT_TOKENS", "4000"))
-OUTPUT_TOKEN_PARAM = os.environ.get("DUET_OUTPUT_TOKEN_PARAM", "max_tokens")
+# Responses-API cap covers reasoning + visible output together, hence the higher
+# default than the old chat.completions 4000 (see server.py for the rationale).
+MAX_OUTPUT_TOKENS = int(os.environ.get("DUET_MAX_OUTPUT_TOKENS", "8000"))
+GPT_REASONING_EFFORT = os.environ.get("DUET_GPT_REASONING_EFFORT", "medium")  # empty = model default
 
 
 class DuetTimeout(Exception):
@@ -145,18 +147,22 @@ def _gpt_call(system: str, user: str) -> str:
         timeout=OPENAI_TIMEOUT,
         max_retries=OPENAI_MAX_RETRIES,
     )
+    call_kwargs = {"reasoning": {"effort": GPT_REASONING_EFFORT}} if GPT_REASONING_EFFORT else {}
     try:
-        resp = client.chat.completions.create(
+        resp = client.responses.create(
             model=GPT_MODEL,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            response_format={"type": "json_object"},
-            **{OUTPUT_TOKEN_PARAM: MAX_OUTPUT_TOKENS},
+            instructions=system,
+            input=user,
+            store=False,
+            text={"format": {"type": "json_object"}},
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            **call_kwargs,
         )
     except Exception as e:
         if _is_timeout_error(e):
             raise DuetTimeout(f"GPT call timed out after ~{OPENAI_TIMEOUT:.0f}s") from e
         raise
-    return resp.choices[0].message.content or "{}"
+    return resp.output_text or "{}"
 
 
 # ---------------------- prompts ----------------------

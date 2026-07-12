@@ -2,15 +2,14 @@
 
 Like test_suspend_resume.py these stub the OpenAI client, so no API key / network is
 needed. The fake records the kwargs of each create() call so we can assert the Pattern A
-loop behaviour (tools offered with response_format unconstrained while the document budget
-remains; forced closure once it is exhausted).
+loop behaviour on the Responses API (tools offered with the text format unconstrained
+while the document budget remains; forced closure once it is exhausted).
 """
 from __future__ import annotations
 
 import json
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 
@@ -22,36 +21,15 @@ import server as srv  # noqa: E402
 
 # ---------------------- fakes ----------------------
 
-class _FakeFunction:
-    def __init__(self, name: str, arguments: str) -> None:
-        self.name = name
-        self.arguments = arguments
-
-
-class _FakeToolCall:
-    def __init__(self, id: str, name: str, arguments: str) -> None:
-        self.id = id
-        self.function = _FakeFunction(name, arguments)
-
-
-class _FakeMessage:
-    def __init__(self, content=None, tool_calls=None) -> None:
-        self.content = content
-        self.tool_calls = tool_calls
-
-
-class _FakeChoice:
-    def __init__(self, message) -> None:
-        self.message = message
-
-
 class _FakeResponse:
-    def __init__(self, message) -> None:
-        self.choices = [_FakeChoice(message)]
+    def __init__(self, output, output_text=None, status="completed") -> None:
+        self.output = output
+        self.output_text = output_text
+        self.status = status
 
 
-class _RecordingCompletions:
-    """Returns scripted messages in order and records every create() kwargs."""
+class _RecordingResponses:
+    """Returns scripted responses in order and records every create() kwargs."""
 
     def __init__(self, scripted) -> None:
         self._scripted = list(scripted)
@@ -59,32 +37,42 @@ class _RecordingCompletions:
         self.call_kwargs = []
 
     def create(self, **kwargs):
-        self.call_kwargs.append(kwargs)
-        msg = self._scripted[self.calls]
+        snap = dict(kwargs)
+        if isinstance(snap.get("input"), list):
+            snap["input"] = [dict(m) for m in snap["input"]]
+        self.call_kwargs.append(snap)
+        resp = self._scripted[self.calls]
         self.calls += 1
-        return _FakeResponse(msg)
+        return resp
 
 
 class _FakeClient:
     def __init__(self, scripted) -> None:
-        self.completions = _RecordingCompletions(scripted)
-        self.chat = types.SimpleNamespace(completions=self.completions)
+        self.responses = _RecordingResponses(scripted)
 
 
-def _tc_msg(call_id: str, name: str, args: dict) -> _FakeMessage:
-    return _FakeMessage(content=None,
-                        tool_calls=[_FakeToolCall(call_id, name, json.dumps(args))])
+def _tc_resp(call_id: str, name: str, args: dict) -> _FakeResponse:
+    return _FakeResponse(output=[
+        {"type": "reasoning", "encrypted_content": f"ENC-{call_id}"},
+        {"type": "function_call", "id": f"fc-{call_id}", "call_id": call_id,
+         "name": name, "arguments": json.dumps(args)},
+    ])
 
 
-def _final_msg(score: int = 92) -> _FakeMessage:
-    return _FakeMessage(content=json.dumps({
+def _final_resp(score: int = 92) -> _FakeResponse:
+    text = json.dumps({
         "role": "critic",
         "candidate_id": "cand-1",
         "counter_draft": None,
         "score_of_candidate": {"value": score, "rationale": "grounded in the document"},
         "critique_items": [],
         "notes": "",
-    }), tool_calls=None)
+    })
+    return _FakeResponse(
+        output=[{"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": text}]}],
+        output_text=text,
+    )
 
 
 def _install(scripted, td) -> _FakeClient:
@@ -153,9 +141,9 @@ class PushRendering(unittest.TestCase):
 class MultiStepPull(unittest.TestCase):
     def test_two_document_requests_then_final(self) -> None:
         scripted = [
-            _tc_msg("call-1", "request_document", {"name": "contract.pdf", "query": "indemnity"}),
-            _tc_msg("call-2", "request_document", {"name": "exhibit-a.pdf"}),
-            _final_msg(94),
+            _tc_resp("call-1", "request_document", {"name": "contract.pdf", "query": "indemnity"}),
+            _tc_resp("call-2", "request_document", {"name": "exhibit-a.pdf"}),
+            _final_resp(94),
         ]
         with tempfile.TemporaryDirectory() as td:
             _install(scripted, td)
@@ -186,8 +174,8 @@ class MultiStepPull(unittest.TestCase):
 
     def test_not_found_result_still_reaches_final(self) -> None:
         scripted = [
-            _tc_msg("call-1", "request_document", {"name": "missing.pdf"}),
-            _final_msg(90),
+            _tc_resp("call-1", "request_document", {"name": "missing.pdf"}),
+            _final_resp(90),
         ]
         with tempfile.TemporaryDirectory() as td:
             _install(scripted, td)
@@ -205,9 +193,9 @@ class BudgetGuard(unittest.TestCase):
         orig = srv.DUET_MAX_DOC_REQUESTS
         srv.DUET_MAX_DOC_REQUESTS = 2
         scripted = [
-            _tc_msg("call-1", "request_document", {"name": "d1"}),
-            _tc_msg("call-2", "request_document", {"name": "d2"}),
-            _final_msg(91),
+            _tc_resp("call-1", "request_document", {"name": "d1"}),
+            _tc_resp("call-2", "request_document", {"name": "d2"}),
+            _final_resp(91),
         ]
         try:
             with tempfile.TemporaryDirectory() as td:
@@ -219,15 +207,15 @@ class BudgetGuard(unittest.TestCase):
                 self.assertEqual(r3["status"], "final")
                 self.assertEqual(srv._STORE.get(sid).doc_requests_made, 2)
 
-                kw = fake.completions.call_kwargs
+                kw = fake.responses.call_kwargs
                 # First two calls: budget remained -> tools offered, no forced json_object.
                 self.assertEqual(kw[0]["tool_choice"], "auto")
-                self.assertNotIn("response_format", kw[0])
+                self.assertNotIn("text", kw[0])
                 self.assertFalse(kw[0]["parallel_tool_calls"])
                 self.assertEqual(kw[1]["tool_choice"], "auto")
                 # Third call: budget exhausted -> forced final.
                 self.assertEqual(kw[2]["tool_choice"], "none")
-                self.assertEqual(kw[2]["response_format"], {"type": "json_object"})
+                self.assertEqual(kw[2]["text"], {"format": {"type": "json_object"}})
         finally:
             srv.DUET_MAX_DOC_REQUESTS = orig
 
@@ -235,9 +223,9 @@ class BudgetGuard(unittest.TestCase):
 class MixedTools(unittest.TestCase):
     def test_request_document_then_slash_command(self) -> None:
         scripted = [
-            _tc_msg("call-1", "request_document", {"name": "brief.txt"}),
-            _tc_msg("call-2", "claude_slash_command", {"name": "austlii-legal-research", "args": "Coco v R"}),
-            _final_msg(93),
+            _tc_resp("call-1", "request_document", {"name": "brief.txt"}),
+            _tc_resp("call-2", "claude_slash_command", {"name": "austlii-legal-research", "args": "Coco v R"}),
+            _final_resp(93),
         ]
         with tempfile.TemporaryDirectory() as td:
             _install(scripted, td)
@@ -258,8 +246,8 @@ class MixedTools(unittest.TestCase):
 class ResumeResultNormalization(unittest.TestCase):
     def test_non_json_request_document_result_is_wrapped(self) -> None:
         scripted = [
-            _tc_msg("call-1", "request_document", {"name": "contract.pdf"}),
-            _final_msg(90),
+            _tc_resp("call-1", "request_document", {"name": "contract.pdf"}),
+            _final_resp(90),
         ]
         with tempfile.TemporaryDirectory() as td:
             _install(scripted, td)
@@ -269,16 +257,17 @@ class ResumeResultNormalization(unittest.TestCase):
             # receives a well-formed request_document result.
             r2 = srv._resume_turn_impl(sid, r1["payload"]["tool_use_id"], "CONTRACT BODY TEXT")
             self.assertEqual(r2["status"], "final")
-            tool_msgs = [m for m in srv._STORE.get(sid).history if m.get("role") == "tool"]
-            self.assertEqual(len(tool_msgs), 1)
-            parsed = json.loads(tool_msgs[0]["content"])  # must be valid JSON now
+            outputs = [m for m in srv._STORE.get(sid).history
+                       if m.get("type") == "function_call_output"]
+            self.assertEqual(len(outputs), 1)
+            parsed = json.loads(outputs[0]["output"])  # must be valid JSON now
             self.assertTrue(parsed["found"])
             self.assertEqual(parsed["content"], "CONTRACT BODY TEXT")
 
     def test_valid_json_request_document_result_passes_through(self) -> None:
         scripted = [
-            _tc_msg("call-1", "request_document", {"name": "contract.pdf"}),
-            _final_msg(90),
+            _tc_resp("call-1", "request_document", {"name": "contract.pdf"}),
+            _final_resp(90),
         ]
         with tempfile.TemporaryDirectory() as td:
             _install(scripted, td)
@@ -286,21 +275,50 @@ class ResumeResultNormalization(unittest.TestCase):
             sid = r1["session_id"]
             payload = json.dumps({"found": True, "name": "contract.pdf", "content": "BODY"})
             srv._resume_turn_impl(sid, r1["payload"]["tool_use_id"], payload)
-            tool_msgs = [m for m in srv._STORE.get(sid).history if m.get("role") == "tool"]
-            self.assertEqual(tool_msgs[0]["content"], payload)  # unchanged
+            outputs = [m for m in srv._STORE.get(sid).history
+                       if m.get("type") == "function_call_output"]
+            self.assertEqual(outputs[0]["output"], payload)  # unchanged
 
     def test_slash_command_result_not_wrapped(self) -> None:
         scripted = [
-            _tc_msg("call-1", "claude_slash_command", {"name": "x", "args": "y"}),
-            _final_msg(90),
+            _tc_resp("call-1", "claude_slash_command", {"name": "x", "args": "y"}),
+            _final_resp(90),
         ]
         with tempfile.TemporaryDirectory() as td:
             _install(scripted, td)
             r1 = srv._start_turn_impl(None, "critic", "spec", "draft", "")
             sid = r1["session_id"]
             srv._resume_turn_impl(sid, r1["payload"]["tool_use_id"], "RAW SLASH OUTPUT")
-            tool_msgs = [m for m in srv._STORE.get(sid).history if m.get("role") == "tool"]
-            self.assertEqual(tool_msgs[0]["content"], "RAW SLASH OUTPUT")  # passed through
+            outputs = [m for m in srv._STORE.get(sid).history
+                       if m.get("type") == "function_call_output"]
+            self.assertEqual(outputs[0]["output"], "RAW SLASH OUTPUT")  # passed through
+
+
+# ---------------------- parallel tool calls (replay safety) ----------------------
+
+class ParallelCallsDropped(unittest.TestCase):
+    def test_extra_function_calls_not_persisted(self) -> None:
+        # Two calls in one response: only the first may be persisted, else the next
+        # replay contains an unanswered function_call and the API rejects it.
+        double = _FakeResponse(output=[
+            {"type": "function_call", "id": "fc-1", "call_id": "call-1",
+             "name": "request_document", "arguments": json.dumps({"name": "a"})},
+            {"type": "function_call", "id": "fc-2", "call_id": "call-2",
+             "name": "request_document", "arguments": json.dumps({"name": "b"})},
+        ])
+        scripted = [double, _final_resp(90)]
+        with tempfile.TemporaryDirectory() as td:
+            _install(scripted, td)
+            r1 = srv._start_turn_impl(None, "critic", "spec", "draft", "")
+            self.assertEqual(r1["status"], "tool_request")
+            self.assertEqual(r1["payload"]["tool_use_id"], "call-1")
+            sid = r1["session_id"]
+            calls_in_history = [m for m in srv._STORE.get(sid).history
+                                if m.get("type") == "function_call"]
+            self.assertEqual(len(calls_in_history), 1)
+            self.assertEqual(calls_in_history[0]["call_id"], "call-1")
+            r2 = srv._resume_turn_impl(sid, "call-1", "{\"found\":true}")
+            self.assertEqual(r2["status"], "final")
 
 
 # ---------------------- duet_run push-only ----------------------
