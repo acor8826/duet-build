@@ -2,10 +2,16 @@
 
 Exposes four tools used by the Claude-side orchestrator to drive a GPT-5.6
 conversation that can itself request Claude Code slash commands. The bridge
-implements the suspend-on-tool-call pattern: when GPT emits a tool_call, the
-bridge persists session state and returns `{status: "tool_request"}` to the
+implements the suspend-on-tool-call pattern: when GPT emits a function_call,
+the bridge persists session state and returns `{status: "tool_request"}` to the
 caller. The caller (Claude orchestrator) executes the requested slash command
 and resumes via duet_gpt_resume_turn.
+
+GPT calls go through the OpenAI Responses API (/v1/responses) statelessly:
+`store=False`, the full item history replayed each call, and reasoning items
+(with encrypted_content) preserved in the session history — that is what lets
+gpt-5.6 combine function tools WITH active reasoning, which chat.completions
+refuses (HTTP 400 unless reasoning_effort='none').
 """
 from __future__ import annotations
 
@@ -48,15 +54,16 @@ DUET_MAX_DOC_REQUESTS = int(os.environ.get("DUET_MAX_DOC_REQUESTS", "4"))  # req
 # and a cumulative cap on pushed-document text. All are env-tunable with safe defaults.
 DUET_OPENAI_TIMEOUT = float(os.environ.get("DUET_OPENAI_TIMEOUT", "150"))  # seconds, < 180s client cap
 DUET_OPENAI_MAX_RETRIES = int(os.environ.get("DUET_OPENAI_MAX_RETRIES", "0"))  # SDK retries would multiply wall-clock
-DUET_MAX_OUTPUT_TOKENS = int(os.environ.get("DUET_MAX_OUTPUT_TOKENS", "4000"))  # cap response generation
-DUET_OUTPUT_TOKEN_PARAM = os.environ.get("DUET_OUTPUT_TOKEN_PARAM", "max_tokens")  # or "max_completion_tokens"
+# On the Responses API the output cap covers reasoning + visible output together,
+# so the default is higher than the old chat.completions cap (4000): at effort
+# "medium" the reasoning share alone can run to thousands of tokens. Wall-clock is
+# still bounded by DUET_OPENAI_TIMEOUT, so the raised cap cannot blow the window.
+DUET_MAX_OUTPUT_TOKENS = int(os.environ.get("DUET_MAX_OUTPUT_TOKENS", "8000"))
 DUET_MAX_TOTAL_DOC_CHARS = int(os.environ.get("DUET_MAX_TOTAL_DOC_CHARS", "120000"))  # cumulative pushed-doc cap
-# gpt-5.6 rejects chat.completions requests that combine function tools with an
-# active reasoning effort (HTTP 400: "use /v1/responses or set reasoning_effort to
-# 'none'"), and the API default effort is active. Tool-bearing calls therefore pin
-# reasoning off. Set empty to omit the param (models that reject it), or a level if
-# a future model supports tools+reasoning on this endpoint.
-DUET_GPT_REASONING_EFFORT = os.environ.get("DUET_GPT_REASONING_EFFORT", "none")
+# Reasoning effort for GPT calls. The Responses API supports tools + reasoning
+# together (the chat.completions combination gpt-5.6 rejects), so reasoning is ON
+# by default again. Set empty to omit the param and take the model default.
+DUET_GPT_REASONING_EFFORT = os.environ.get("DUET_GPT_REASONING_EFFORT", "medium")
 
 # Below this candidate size the payload is "small" and gets no concise-critique nudge.
 _CONCISE_NUDGE_CANDIDATE_CHARS = 8000
@@ -91,26 +98,26 @@ def _is_timeout_error(exc: Exception) -> bool:
 _STORE = SessionStore(STATE_DIR)
 
 
-# The single tool we tell GPT it can call.
+# The single tool we tell GPT it can call. Responses-API function tools are flat
+# (name/description/parameters at the top level), unlike chat.completions' nested
+# {"function": {...}} shape.
 CLAUDE_SLASH_TOOL = {
     "type": "function",
-    "function": {
-        "name": "claude_slash_command",
-        "description": (
-            "Ask the Claude Code orchestrator to execute one of its slash commands "
-            "(for example /austlii-legal-research) and return the result. "
-            "Use this whenever a tool would give a more authoritative answer than "
-            "your own recollection — especially for citations, legislation, or current facts."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Slash command name, no leading slash."},
-                "args": {"type": "string", "description": "Arguments to pass after the command name."},
-            },
-            "required": ["name", "args"],
-            "additionalProperties": False,
+    "name": "claude_slash_command",
+    "description": (
+        "Ask the Claude Code orchestrator to execute one of its slash commands "
+        "(for example /austlii-legal-research) and return the result. "
+        "Use this whenever a tool would give a more authoritative answer than "
+        "your own recollection — especially for citations, legislation, or current facts."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Slash command name, no leading slash."},
+            "args": {"type": "string", "description": "Arguments to pass after the command name."},
         },
+        "required": ["name", "args"],
+        "additionalProperties": False,
     },
 }
 
@@ -121,28 +128,26 @@ CLAUDE_SLASH_TOOL = {
 # (Claude Code / cowork / web) resolves it (e.g. from a co-work vault) and resumes.
 REQUEST_DOCUMENT_TOOL = {
     "type": "function",
-    "function": {
-        "name": "request_document",
-        "description": (
-            "Request the actual full text of a document so you can ground your critique in "
-            "the real source instead of guessing. The Claude orchestrator will fetch it "
-            "(for example from the co-work vault, the project files, or an upload) and return "
-            "its text. Use this whenever your advice depends on a document's real contents — "
-            "especially for documents named in the spec or listed under AVAILABLE DOCUMENTS. "
-            "You may request several documents in turn before giving your final answer. The "
-            "result is a JSON object: {\"found\":true,\"name\":..,\"content\":..,\"truncated\":..} "
-            "or {\"found\":false,\"reason\":..,\"available\":[..]} if it could not be located."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Document name/identifier/path to fetch (e.g. from the AVAILABLE DOCUMENTS catalog)."},
-                "query": {"type": "string", "description": "What you are looking for in it / why you need it."},
-                "source_hint": {"type": "string", "description": "Optional hint on where to look, e.g. 'cowork_vault', 'project_files', 'any'."},
-            },
-            "required": ["name"],
-            "additionalProperties": False,
+    "name": "request_document",
+    "description": (
+        "Request the actual full text of a document so you can ground your critique in "
+        "the real source instead of guessing. The Claude orchestrator will fetch it "
+        "(for example from the co-work vault, the project files, or an upload) and return "
+        "its text. Use this whenever your advice depends on a document's real contents — "
+        "especially for documents named in the spec or listed under AVAILABLE DOCUMENTS. "
+        "You may request several documents in turn before giving your final answer. The "
+        "result is a JSON object: {\"found\":true,\"name\":..,\"content\":..,\"truncated\":..} "
+        "or {\"found\":false,\"reason\":..,\"available\":[..]} if it could not be located."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Document name/identifier/path to fetch (e.g. from the AVAILABLE DOCUMENTS catalog)."},
+            "query": {"type": "string", "description": "What you are looking for in it / why you need it."},
+            "source_hint": {"type": "string", "description": "Optional hint on where to look, e.g. 'cowork_vault', 'project_files', 'any'."},
         },
+        "required": ["name"],
+        "additionalProperties": False,
     },
 }
 
@@ -246,17 +251,53 @@ def _build_user_message(
     return "\n".join(parts)
 
 
+def _item_dict(item: Any) -> Dict[str, Any]:
+    """Normalise a Responses output item (SDK pydantic object or plain dict) to a dict."""
+    if isinstance(item, dict):
+        return item
+    return item.model_dump(exclude_none=True)
+
+
+def _output_text(items: List[Dict[str, Any]]) -> str:
+    """Join the output_text parts of the message items (mirrors resp.output_text)."""
+    parts: List[str] = []
+    for d in items:
+        if d.get("type") == "message":
+            for part in d.get("content") or []:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    parts.append(part.get("text") or "")
+    return "".join(parts)
+
+
+def _is_legacy_history(history: List[Dict[str, Any]]) -> bool:
+    """True if the history is in the pre-Responses chat.completions message format.
+
+    Those sessions contain {"role": "tool", ...} results and/or assistant messages
+    carrying "tool_calls" — shapes the Responses API input rejects, so they cannot
+    be replayed after the migration.
+    """
+    return any(
+        isinstance(m, dict) and (m.get("role") == "tool" or "tool_calls" in m)
+        for m in history
+    )
+
+
 def _run_openai_loop(session: Session) -> Dict[str, Any]:
-    """Run the OpenAI chat loop until GPT emits a tool_call (suspend) or returns a final.
+    """Run the Responses loop until GPT emits a function_call (suspend) or a final.
 
     GPT may call either tool — `claude_slash_command` or `request_document`. While the
-    per-turn document-request budget remains, the tools are offered with `response_format`
+    per-turn document-request budget remains, the tools are offered with the text format
     left UNCONSTRAINED, so GPT can make a *second* tool call after seeing the first result;
     that is what makes the document pull genuinely multi-step (forcing `json_object` on
     every call, as the old gating effectively did, suppresses the second tool call). Once
     the budget is exhausted we force closure with `tool_choice="none"` + `json_object` so
     GPT must emit a final WorkProduct. The final content is parsed tolerantly because an
     unconstrained response may arrive fenced or prose-wrapped.
+
+    Statelessness: every call replays the session's full item history with `store=False`,
+    and ALL output items — including reasoning items with encrypted_content — are appended
+    to the history, because the API requires the reasoning items between a function_call
+    and its function_call_output to be replayed on the next request.
     """
     client = _openai_client()
     while True:
@@ -271,16 +312,19 @@ def _run_openai_loop(session: Session) -> Dict[str, Any]:
             call_kwargs = {
                 "tools": [CLAUDE_SLASH_TOOL, REQUEST_DOCUMENT_TOOL],
                 "tool_choice": "none",
-                "response_format": {"type": "json_object"},
+                "text": {"format": {"type": "json_object"}},
             }
-        # Bound the response so generation can't run past the client window.
-        call_kwargs[DUET_OUTPUT_TOKEN_PARAM] = DUET_MAX_OUTPUT_TOKENS
+        # Bound the response (reasoning + output together on this API) so generation
+        # can't run past the client window.
+        call_kwargs["max_output_tokens"] = DUET_MAX_OUTPUT_TOKENS
         if DUET_GPT_REASONING_EFFORT:
-            call_kwargs["reasoning_effort"] = DUET_GPT_REASONING_EFFORT
+            call_kwargs["reasoning"] = {"effort": DUET_GPT_REASONING_EFFORT}
         try:
-            resp = client.chat.completions.create(
+            resp = client.responses.create(
                 model=MODEL,
-                messages=session.history,
+                input=session.history,
+                store=False,
+                include=["reasoning.encrypted_content"],
                 **call_kwargs,
             )
         except Exception as e:
@@ -308,56 +352,82 @@ def _run_openai_loop(session: Session) -> Dict[str, Any]:
                     ),
                 },
             }
-        choice = resp.choices[0]
-        msg = choice.message
 
-        if msg.tool_calls:
-            tc = msg.tool_calls[0]  # serialise tool calls one at a time
-            # Persist ONLY the served tool call so history stays valid (a single tool
-            # result answers it); any extra parallel calls are dropped and GPT can
-            # re-request next round.
-            if len(msg.tool_calls) > 1:
-                dropped = [t.function.name for t in msg.tool_calls[1:]]
-                print(
-                    f"[duet-bridge] session={session.session_id}: serving "
-                    f"{tc.function.name!r}, dropped {len(dropped)} parallel tool call(s) "
-                    f"{dropped} (GPT may re-request next round)",
-                    file=sys.stderr,
-                )
-            session.history.append({
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": [{
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                }],
-            })
+        items = [_item_dict(it) for it in (resp.output or [])]
+        calls = [d for d in items if d.get("type") == "function_call"]
+        text = getattr(resp, "output_text", None) or _output_text(items)
+        status = getattr(resp, "status", "completed") or "completed"
+
+        # Ran out of output tokens (reasoning counts against the cap here) before
+        # producing anything usable. Return retriable WITHOUT persisting the partial
+        # items so a retry replays a clean history.
+        if not calls and not text and status != "completed":
+            return {
+                "status": "error",
+                "payload": {
+                    "error": "gpt_incomplete",
+                    "retriable": True,
+                    "response_status": status,
+                    "detail": str(getattr(resp, "incomplete_details", None)),
+                    "hint": (
+                        "The model stopped before a final answer — most likely the output-token "
+                        "cap was consumed by reasoning. Retry with a condensed candidate, or "
+                        "raise DUET_MAX_OUTPUT_TOKENS / lower DUET_GPT_REASONING_EFFORT."
+                    ),
+                },
+            }
+
+        # Persist every output item in order (reasoning items included — they must be
+        # replayed next call), keeping only the FIRST function_call: a single tool
+        # result answers it, and any extra parallel calls are dropped so the replayed
+        # history never contains an unanswered function_call. GPT can re-request next
+        # round.
+        first_call: Optional[Dict[str, Any]] = None
+        kept: List[Dict[str, Any]] = []
+        for d in items:
+            if d.get("type") == "function_call":
+                if first_call is None:
+                    first_call = d
+                    kept.append(d)
+                continue
+            kept.append(d)
+        if len(calls) > 1:
+            dropped = [c.get("name") for c in calls[1:]]
+            print(
+                f"[duet-bridge] session={session.session_id}: serving "
+                f"{first_call.get('name')!r}, dropped {len(dropped)} parallel tool call(s) "
+                f"{dropped} (GPT may re-request next round)",
+                file=sys.stderr,
+            )
+        session.history.extend(kept)
+
+        if first_call:
+            call_id = first_call.get("call_id") or first_call.get("id")
+            name = first_call.get("name") or ""
             try:
-                args = json.loads(tc.function.arguments or "{}")
+                args = json.loads(first_call.get("arguments") or "{}")
             except json.JSONDecodeError:
-                args = {"_raw": tc.function.arguments}
-            if tc.function.name == "request_document":
+                args = {"_raw": first_call.get("arguments")}
+            if name == "request_document":
                 session.doc_requests_made += 1
-            session.pending_tool_use_id = tc.id
-            session.pending_tool_name = tc.function.name
+            session.pending_tool_use_id = call_id
+            session.pending_tool_name = name
             session.pending_tool_args = args
             _STORE.put(session)
             return {
                 "status": "tool_request",
                 "payload": {
-                    "tool_name": tc.function.name,
+                    "tool_name": name,
                     "tool_args": args,
-                    "tool_use_id": tc.id,
+                    "tool_use_id": call_id,
                 },
             }
 
-        # No tool call → final. Persist the assistant message and parse tolerantly.
-        session.history.append({"role": "assistant", "content": msg.content or ""})
-        wp_dict = _json_obj(msg.content or "")
+        # No tool call → final. Output items are already persisted; parse tolerantly.
+        wp_dict = _json_obj(text or "")
         if not wp_dict:
             wp_dict = {"role": session.role, "candidate_id": "unknown",
-                       "notes": msg.content or "", "critique_items": []}
+                       "notes": text or "", "critique_items": []}
         # Validate via pydantic (best-effort).
         try:
             wp = WorkProduct.model_validate(wp_dict)
@@ -398,8 +468,10 @@ def _start_turn_impl(
         }}
     sid = session_id or f"sess-{uuid.uuid4().hex[:12]}"
     existing = _STORE.get(sid)
-    if existing and not existing.closed:
+    if existing and not existing.closed and not _is_legacy_history(existing.history):
         # Reuse — caller may want to continue. But typical pattern: start = fresh.
+        # (A legacy chat.completions-format session from before the Responses-API
+        # migration cannot be replayed; fall through and start fresh instead.)
         session = existing
     else:
         session = Session(
@@ -426,6 +498,14 @@ def _resume_turn_impl(
     session = _STORE.get(session_id)
     if not session:
         return {"status": "error", "payload": {"error": f"unknown session: {session_id}"}}
+    if _is_legacy_history(session.history):
+        return {"status": "error", "payload": {
+            "error": "legacy_session_format",
+            "hint": (
+                "This session was created by the pre-Responses-API bridge and cannot be "
+                "resumed after the upgrade. Start a fresh turn with duet_gpt_start_turn."
+            ),
+        }}
     if session.pending_tool_use_id != tool_use_id:
         return {
             "status": "error",
@@ -446,7 +526,7 @@ def _resume_turn_impl(
         except (ValueError, TypeError):
             content = json.dumps({"found": True, "content": tool_result})
     session.history.append(
-        {"role": "tool", "tool_call_id": tool_use_id, "content": content}
+        {"type": "function_call_output", "call_id": tool_use_id, "output": content}
     )
     session.pending_tool_use_id = None
     session.pending_tool_name = None
@@ -469,6 +549,8 @@ def _health_impl() -> Dict[str, Any]:
     return {
         "ok": True,
         "model": MODEL,
+        "gpt_api": "responses",
+        "gpt_reasoning_effort": DUET_GPT_REASONING_EFFORT or "(model default)",
         "transport": TRANSPORT,
         "state_dir": STATE_DIR,
         "opus_model": duet_run_mod.OPUS_MODEL,

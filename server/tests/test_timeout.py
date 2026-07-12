@@ -1,11 +1,14 @@
 """Bounded-call tests: the bridge must return INSIDE the MCP client's ~180s tool-call cap.
 
-These stub the OpenAI client (no API key / network needed) and assert the three guards
-added for large document payloads:
+These stub the OpenAI client (no API key / network needed) and assert the guards for
+large document payloads on the Responses API:
   * the client is constructed with a sub-cap request timeout and no retries;
-  * every chat.completions.create() carries the output-token cap;
+  * every responses.create() carries the output-token cap (which on this API bounds
+    reasoning + visible output together);
   * a timeout-class error from create() is converted to a clean, retriable `gpt_timeout`
-    response (not a silent overrun) and leaves the session free of a dangling pending tool.
+    response (not a silent overrun) and leaves the session free of a dangling pending tool;
+  * an `incomplete` response with no usable output (cap eaten by reasoning) is converted
+    to a retriable `gpt_incomplete` without polluting the replayable history.
 """
 from __future__ import annotations
 
@@ -32,24 +35,15 @@ class _StubTimeout(Exception):
     """Class name contains 'Timeout' so _is_timeout_error matches it via the name fallback."""
 
 
-class _FakeMessage:
-    def __init__(self, content=None, tool_calls=None) -> None:
-        self.content = content
-        self.tool_calls = tool_calls
-
-
-class _FakeChoice:
-    def __init__(self, message) -> None:
-        self.message = message
-
-
 class _FakeResponse:
-    def __init__(self, message) -> None:
-        self.choices = [_FakeChoice(message)]
+    def __init__(self, output, output_text=None, status="completed") -> None:
+        self.output = output
+        self.output_text = output_text
+        self.status = status
 
 
-class _RecordingCompletions:
-    """Returns scripted messages (or raises a scripted exception) and records create() kwargs."""
+class _RecordingResponses:
+    """Returns scripted responses (or raises a scripted exception) and records create() kwargs."""
 
     def __init__(self, scripted) -> None:
         self._scripted = list(scripted)
@@ -57,29 +51,36 @@ class _RecordingCompletions:
         self.call_kwargs = []
 
     def create(self, **kwargs):
-        self.call_kwargs.append(kwargs)
+        snap = dict(kwargs)
+        if isinstance(snap.get("input"), list):
+            snap["input"] = [dict(m) for m in snap["input"]]
+        self.call_kwargs.append(snap)
         item = self._scripted[self.calls]
         self.calls += 1
         if isinstance(item, Exception):
             raise item
-        return _FakeResponse(item)
+        return item
 
 
 class _FakeClient:
     def __init__(self, scripted) -> None:
-        self.completions = _RecordingCompletions(scripted)
-        self.chat = types.SimpleNamespace(completions=self.completions)
+        self.responses = _RecordingResponses(scripted)
 
 
-def _final_msg(score: int = 92) -> _FakeMessage:
-    return _FakeMessage(content=json.dumps({
+def _final_resp(score: int = 92) -> _FakeResponse:
+    text = json.dumps({
         "role": "critic",
         "candidate_id": "cand-1",
         "counter_draft": None,
         "score_of_candidate": {"value": score, "rationale": "ok"},
         "critique_items": [],
         "notes": "",
-    }), tool_calls=None)
+    })
+    return _FakeResponse(
+        output=[{"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": text}]}],
+        output_text=text,
+    )
 
 
 def _install(scripted, td) -> _FakeClient:
@@ -122,17 +123,18 @@ class ClientBounded(unittest.TestCase):
                 os.environ["OPENAI_API_KEY"] = old_key
 
 
-# ---------------------- output-token cap ----------------------
+# ---------------------- output-token cap + reasoning ----------------------
 
 class OutputCap(unittest.TestCase):
-    def test_create_carries_output_token_cap(self) -> None:
+    def test_create_carries_output_token_cap_and_reasoning(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            fake = _install([_final_msg(90)], td)
+            fake = _install([_final_resp(90)], td)
             r = srv._start_turn_impl(None, "critic", "spec", "draft", "")
             self.assertEqual(r["status"], "final")
-            kw = fake.completions.call_kwargs[0]
-            self.assertIn(srv.DUET_OUTPUT_TOKEN_PARAM, kw)
-            self.assertEqual(kw[srv.DUET_OUTPUT_TOKEN_PARAM], srv.DUET_MAX_OUTPUT_TOKENS)
+            kw = fake.responses.call_kwargs[0]
+            self.assertEqual(kw["max_output_tokens"], srv.DUET_MAX_OUTPUT_TOKENS)
+            if srv.DUET_GPT_REASONING_EFFORT:
+                self.assertEqual(kw["reasoning"], {"effort": srv.DUET_GPT_REASONING_EFFORT})
 
 
 # ---------------------- fail-fast on timeout ----------------------
@@ -158,6 +160,27 @@ class TimeoutFailsFast(unittest.TestCase):
             _install([ValueError("boom")], td)
             with self.assertRaises(ValueError):
                 srv._start_turn_impl(None, "critic", "spec", "draft", "")
+
+
+# ---------------------- fail-fast on cap-starved responses ----------------------
+
+class IncompleteFailsFast(unittest.TestCase):
+    def test_incomplete_with_no_output_returns_retriable_and_clean_history(self) -> None:
+        # Reasoning consumed the whole output-token cap: no message, no function_call.
+        starved = _FakeResponse(
+            output=[{"type": "reasoning", "encrypted_content": "ENC-partial"}],
+            output_text=None,
+            status="incomplete",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            _install([starved], td)
+            r = srv._start_turn_impl(None, "critic", "spec", "draft", "")
+            self.assertEqual(r["status"], "error")
+            self.assertEqual(r["payload"]["error"], "gpt_incomplete")
+            self.assertIs(r["payload"]["retriable"], True)
+            # The partial reasoning item must NOT have been persisted for replay.
+            sess = srv._STORE.get(r["session_id"])
+            self.assertFalse(any(m.get("type") == "reasoning" for m in sess.history))
 
 
 if __name__ == "__main__":
