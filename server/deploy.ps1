@@ -77,6 +77,16 @@ function Invoke-GcloudPiped {
     if ($LASTEXITCODE -ne 0) { throw "gcloud $($GcloudArgs -join ' ') failed with exit $LASTEXITCODE" }
 }
 
+function Test-GcloudResource {
+    param([Parameter(Mandatory)][string[]]$GcloudArgs)
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = 0
+    & gcloud @GcloudArgs 2>&1 | Out-Null
+    $ok = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = 'Stop'
+    return $ok
+}
+
 Require-Gcloud
 
 if (-not $Project) {
@@ -167,6 +177,21 @@ if ($anthropicExists) {
 
 $srcDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# Durable session state: suspended GPT turns must survive Cloud Run instance
+# recycling during long orchestrator-side research pauses (/tmp dies with the
+# instance). Bucket is created once; runtime SA gets object access.
+$stateBucket = "$Project-duet-state"
+if (-not (Test-GcloudResource @('storage', 'buckets', 'describe', "gs://$stateBucket", "--project=$Project"))) {
+    Write-Output "Creating state bucket gs://$stateBucket..."
+    Invoke-Gcloud storage buckets create "gs://$stateBucket" --location $Region --project $Project --uniform-bucket-level-access
+}
+$projNumState = (& gcloud projects describe $Project --format 'value(projectNumber)' 2>$null)
+if ($projNumState) {
+    Invoke-Gcloud storage buckets add-iam-policy-binding "gs://$stateBucket" `
+        --member "serviceAccount:$projNumState-compute@developer.gserviceaccount.com" `
+        --role roles/storage.objectAdmin --project $Project | Out-Null
+}
+
 Write-Output 'Deploying to Cloud Run...'
 # Invoke-Gcloud already throws on a non-zero exit, so no separate check is needed.
 Invoke-Gcloud run deploy $ServiceName `
@@ -174,13 +199,13 @@ Invoke-Gcloud run deploy $ServiceName `
     --region $Region `
     --project $Project `
     --allow-unauthenticated `
-    --set-env-vars "OPENAI_PARTNER_MODEL=$PartnerModel,DUET_TRANSPORT=http,DUET_STATE_DIR=/tmp/duet-state,DUET_ITERATION_CAP=8,DUET_CONFIDENCE_THRESHOLD=95,DUET_OPUS_MODEL=claude-fable-5,DUET_OPENAI_TIMEOUT=150,DUET_MAX_OUTPUT_TOKENS=8000,DUET_GPT_REASONING_EFFORT=medium,DUET_MAX_TOTAL_DOC_CHARS=120000" `
+    --set-env-vars "OPENAI_PARTNER_MODEL=$PartnerModel,DUET_TRANSPORT=http,DUET_STATE_DIR=/tmp/duet-state,DUET_STATE_GCS_BUCKET=$stateBucket,DUET_ITERATION_CAP=8,DUET_CONFIDENCE_THRESHOLD=95,DUET_OPUS_MODEL=claude-fable-5,DUET_OPENAI_TIMEOUT=150,DUET_MAX_OUTPUT_TOKENS=8000,DUET_GPT_REASONING_EFFORT=medium,DUET_MAX_TOTAL_DOC_CHARS=120000,DUET_MAX_TOOL_RESULT_CHARS=60000" `
     --set-secrets $secretMap `
     --memory 512Mi `
     --cpu 1 `
     --concurrency 4 `
     --max-instances 3 `
-    --timeout 900
+    --timeout 3600
 
 Write-Output 'Fetching service URL...'
 $url = Invoke-Gcloud run services describe $ServiceName --region $Region --project $Project --format 'value(status.url)'

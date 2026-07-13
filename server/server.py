@@ -60,6 +60,12 @@ DUET_OPENAI_MAX_RETRIES = int(os.environ.get("DUET_OPENAI_MAX_RETRIES", "0"))  #
 # still bounded by DUET_OPENAI_TIMEOUT, so the raised cap cannot blow the window.
 DUET_MAX_OUTPUT_TOKENS = int(os.environ.get("DUET_MAX_OUTPUT_TOKENS", "8000"))
 DUET_MAX_TOTAL_DOC_CHARS = int(os.environ.get("DUET_MAX_TOTAL_DOC_CHARS", "120000"))  # cumulative pushed-doc cap
+# Cap on a single orchestrator-provided tool result (slash-command/skill output or a
+# fetched document). GPT-side skill requests (e.g. australian-legal-research) can come
+# back as very large reports; an unbounded result would make the NEXT GPT call outrun
+# the ~180s client window. The research itself is never cut short — it runs
+# orchestrator-side with no limit; only the text handed back to GPT is bounded.
+DUET_MAX_TOOL_RESULT_CHARS = int(os.environ.get("DUET_MAX_TOOL_RESULT_CHARS", "60000"))
 # Reasoning effort for GPT calls. The Responses API supports tools + reasoning
 # together (the chat.completions combination gpt-5.6 rejects), so reasoning is ON
 # by default again. Set empty to omit the param and take the model default.
@@ -105,10 +111,14 @@ CLAUDE_SLASH_TOOL = {
     "type": "function",
     "name": "claude_slash_command",
     "description": (
-        "Ask the Claude Code orchestrator to execute one of its slash commands "
-        "(for example /austlii-legal-research) and return the result. "
-        "Use this whenever a tool would give a more authoritative answer than "
-        "your own recollection — especially for citations, legislation, or current facts."
+        "Ask the orchestrator to execute a skill / slash command and return the result. "
+        "Available skills include: australian-legal-research (verify Australian "
+        "cases/legislation, 'is this still good law'), submissions-verification "
+        "(verify every citation in a draft), and submission-drafting (persuasive-writing "
+        "review; stages devils-advocate, fact-finder, porter-gate can be named in args). "
+        "Use this whenever a skill would give a more authoritative answer than your own "
+        "recollection — especially for citations, legislation, or current facts. The "
+        "research runs orchestrator-side with no time limit while your turn suspends."
     ),
     "parameters": {
         "type": "object",
@@ -492,6 +502,30 @@ def _start_turn_impl(
     return result
 
 
+def _bound_tool_result(content: str) -> str:
+    """Cap an orchestrator-provided tool result so the resume call stays inside the
+    client window. JSON-aware: for a JSON-object result (request_document shape) the
+    cap lands on its 'content' field so the envelope stays parseable; otherwise the
+    raw text is truncated with a marker GPT can act on."""
+    if len(content) <= DUET_MAX_TOOL_RESULT_CHARS:
+        return content
+    marker = (
+        "\n[...result truncated by the bridge — the full material exists on the "
+        "orchestrator's side; ask specifically for the part you still need]"
+    )
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        obj = None
+    if isinstance(obj, dict) and isinstance(obj.get("content"), str):
+        overflow = len(content) - DUET_MAX_TOOL_RESULT_CHARS
+        keep = max(0, len(obj["content"]) - overflow)
+        obj["content"] = obj["content"][:keep] + marker
+        obj["truncated"] = True
+        return json.dumps(obj)
+    return content[:DUET_MAX_TOOL_RESULT_CHARS] + marker
+
+
 def _resume_turn_impl(
     session_id: str, tool_use_id: str, tool_result: str
 ) -> Dict[str, Any]:
@@ -526,7 +560,8 @@ def _resume_turn_impl(
         except (ValueError, TypeError):
             content = json.dumps({"found": True, "content": tool_result})
     session.history.append(
-        {"type": "function_call_output", "call_id": tool_use_id, "output": content}
+        {"type": "function_call_output", "call_id": tool_use_id,
+         "output": _bound_tool_result(content)}
     )
     session.pending_tool_use_id = None
     session.pending_tool_name = None

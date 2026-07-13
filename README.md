@@ -273,6 +273,8 @@ connector — no need to remove and re-add).
 | `DUET_CONFIDENCE_THRESHOLD` | `95`                                         | Min score (both models) required to converge.            |
 | `DUET_MAX_DOC_CHARS`        | `100000`                                     | Per-document content cap (push + pull); longer text is truncated and marked. |
 | `DUET_MAX_DOC_REQUESTS`     | `4`                                          | Max `request_document` pulls GPT may make per turn before the bridge forces a final. |
+| `DUET_MAX_TOOL_RESULT_CHARS` | `60000`                                     | Cap on one orchestrator-provided tool result (skill output / fetched doc) so the resume call stays inside the client window. JSON-aware truncation with a marker. |
+| `DUET_STATE_GCS_BUCKET`     | (unset; deploy sets `<project>-duet-state`)  | Durable session tier: suspended GPT turns survive instance recycling during long orchestrator-side research pauses. |
 | `DUET_GPT_REASONING_EFFORT` | `medium`                                     | GPT reasoning effort. The Responses API supports tools + reasoning together, so reasoning is on by default. Empty = model default. |
 | `DUET_TRANSPORT`            | `stdio`                                      | `stdio` (local MCP) or `http` (Cloud Run).               |
 | `DUET_STATE_DIR`            | `C:\Users\acor8\.claude\duet` / `/tmp/duet-state` | Session + lock directory.                          |

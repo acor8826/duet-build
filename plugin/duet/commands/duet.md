@@ -54,8 +54,15 @@ This command calls connector tools `duet_gpt_start_turn` / `duet_gpt_resume_turn
 `status: "tool_request"` means GPT needs something first: resolve it and resume via
 `duet_gpt_resume_turn(session_id, tool_use_id, tool_result)`, repeating until the turn
 returns `status: "final"`. Branch on `payload.tool_name`:
-- **`claude_slash_command`** — run the slash command if available on this surface and
-  resume with its output; else resume noting it's unavailable.
+- **`claude_slash_command`** — GPT may request the skills `australian-legal-research`,
+  `submissions-verification`, or `submission-drafting` (args may name a stage:
+  `devils-advocate`, `fact-finder`, `porter-gate`). Run the matching skill on this
+  surface (directly or via a Task subagent) and resume with its output — research can
+  take as long as it needs; the bridge session waits (durable state) and bounds the
+  result so the resume fits the window. If the skill isn't available, do the closest
+  lookup with your own tools and resume with that, noting the substitution. On an
+  `unknown session` error after a very long pause, restart the turn with a fresh
+  `duet_gpt_start_turn`, folding findings into `history_note`.
 - **`request_document`** — fetch the named document (`payload.tool_args.name`) from the
   co-work vault / project files / uploads (extract text from PDF/DOCX) and resume with a
   JSON string `{"found":true,"name":..,"content":..,"truncated":false}` (or

@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "duet",
-      "version": "2.1.0",
+      "version": "2.2.0",
       "description": "Two-model consensus collaboration. Ships the /duet slash command plus an auto-triggering skill: Claude Fable 5 drafts, OpenAI GPT-5.6 (via the duet-bridge connector) critiques and scores, they iterate to consensus, then an independent verifier signs off. Packaged as a plugin so /duet resolves through the command resolver (unaffected by the personal-skill marketplace-catalog resolver bug).",
       "source": "./duet",
       "category": "productivity"

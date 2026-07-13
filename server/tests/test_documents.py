@@ -294,6 +294,54 @@ class ResumeResultNormalization(unittest.TestCase):
             self.assertEqual(outputs[0]["output"], "RAW SLASH OUTPUT")  # passed through
 
 
+# ---------------------- tool-result bounding (time-budget guard) ----------------------
+
+class ToolResultBounding(unittest.TestCase):
+    def test_oversized_slash_result_truncated_with_marker(self) -> None:
+        # A huge research report must be capped so the resume call stays inside
+        # the client window; the marker tells GPT the full material still exists.
+        orig = srv.DUET_MAX_TOOL_RESULT_CHARS
+        srv.DUET_MAX_TOOL_RESULT_CHARS = 100
+        scripted = [
+            _tc_resp("call-1", "claude_slash_command",
+                     {"name": "australian-legal-research", "args": "Coco v R"}),
+            _final_resp(90),
+        ]
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                _install(scripted, td)
+                r1 = srv._start_turn_impl(None, "critic", "spec", "draft", "")
+                srv._resume_turn_impl(r1["session_id"], r1["payload"]["tool_use_id"], "R" * 500)
+                outputs = [m for m in srv._STORE.get(r1["session_id"]).history
+                           if m.get("type") == "function_call_output"]
+                self.assertTrue(outputs[0]["output"].startswith("R" * 100))
+                self.assertNotIn("R" * 101, outputs[0]["output"])
+                self.assertIn("truncated by the bridge", outputs[0]["output"])
+        finally:
+            srv.DUET_MAX_TOOL_RESULT_CHARS = orig
+
+    def test_oversized_json_document_result_stays_parseable(self) -> None:
+        orig = srv.DUET_MAX_TOOL_RESULT_CHARS
+        srv.DUET_MAX_TOOL_RESULT_CHARS = 200
+        scripted = [
+            _tc_resp("call-1", "request_document", {"name": "big.txt"}),
+            _final_resp(90),
+        ]
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                _install(scripted, td)
+                r1 = srv._start_turn_impl(None, "critic", "spec", "draft", "")
+                payload = json.dumps({"found": True, "name": "big.txt", "content": "D" * 1000})
+                srv._resume_turn_impl(r1["session_id"], r1["payload"]["tool_use_id"], payload)
+                outputs = [m for m in srv._STORE.get(r1["session_id"]).history
+                           if m.get("type") == "function_call_output"]
+                parsed = json.loads(outputs[0]["output"])  # envelope must survive the cap
+                self.assertTrue(parsed["truncated"])
+                self.assertIn("truncated by the bridge", parsed["content"])
+        finally:
+            srv.DUET_MAX_TOOL_RESULT_CHARS = orig
+
+
 # ---------------------- parallel tool calls (replay safety) ----------------------
 
 class ParallelCallsDropped(unittest.TestCase):

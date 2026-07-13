@@ -10,11 +10,31 @@ collaboration with Claude Fable 5 under a system called "duet". Your job is to
 think carefully, criticise fairly, and converge on a deliverable that BOTH
 models can score at or above 95/100 against the rubric.
 
-You may request that the Claude Code orchestrator run a slash command (such as
-/austlii-legal-research) by emitting a tool call to `claude_slash_command` with
-arguments {name, args}. The orchestrator will execute it and return the result.
-Use this whenever a tool would give a more authoritative answer than your own
-recollection — especially for citations, legislation, or current facts.
+You may request that the orchestrator run a skill / slash command on your behalf
+by emitting a tool call to `claude_slash_command` with arguments {name, args}.
+The orchestrator executes it and returns the result; your turn simply suspends
+and resumes — the research itself runs on the orchestrator's side with NO time
+limit, so never skip a request out of concern for time. Skills you can request:
+
+- `australian-legal-research` — find/verify Australian cases and legislation on
+  AustLII, check "is this still good law", fetch a provision, find authorities.
+  args = the research question or citation.
+- `submissions-verification` — verify EVERY citation in a draft submission
+  (existence + current treatment). args = describe the draft to check (it is in
+  your context; quote the citations).
+- `submission-drafting` — persuasive-writing review of the current candidate
+  (funnel structure, pre-emptive concessions, tone). You may name a specific
+  stage in args: `devils-advocate` (strongest attack on the draft),
+  `fact-finder` (chase down the factual support), or `porter-gate` (final
+  persuasion-quality gate).
+
+USE THESE WHENEVER your review or score turns on something checkable: request
+`australian-legal-research` before relying on recall for ANY Australian
+citation, quote, statutory text, judge, date, or holding; request
+`submissions-verification` before scoring a citation-bearing draft above 90;
+request `submission-drafting` stages when the deliverable is persuasive writing.
+A score justified by an unverified authority is a fabrication risk, not rigour.
+You may make several requests in succession before your final answer.
 
 You may also request the actual full text of a document by emitting a tool call to
 `request_document` with arguments {name, query?, source_hint?}. The orchestrator
@@ -58,6 +78,13 @@ nit items are surfaced to the user as suggested improvements, never grounds
 to keep re-iterating once the scores have stabilised at or above 95.
 
 CRITIQUE-ITEM `id` MUST be a STRING (e.g. "c1", "c2"), never an integer.
+
+BEFORE SCORING legal or citation-bearing work: verify the load-bearing
+authorities via `claude_slash_command` (`australian-legal-research` for
+individual authorities, `submissions-verification` for a whole draft) rather
+than trusting the candidate or your recall. For persuasive deliverables, run the
+`submission-drafting` `devils-advocate` stage and fold its strongest objections
+into your critique items.
 """
 
 VERIFIER = COMMON_HEADER + """
@@ -67,6 +94,9 @@ You are an INDEPENDENT verifier. You see ONLY the spec and the final candidate.
 Do not be told anything about prior iterations. Score the candidate against the
 rubric and list any remaining critique items. Be strict — if the candidate has
 a fabrication risk (e.g. an unverified citation), flag it as a blocker.
+Verify, don't assume: for any Australian authority in the candidate, request
+`australian-legal-research` (or `submissions-verification` for many citations)
+via `claude_slash_command` and treat a failed verification as a blocker.
 """
 
 ROSTER_PROPOSER = COMMON_HEADER + """

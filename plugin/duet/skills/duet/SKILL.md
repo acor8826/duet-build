@@ -2,7 +2,7 @@
 name: duet
 description: Two-model consensus collaboration between Claude Fable 5 and OpenAI GPT-5.6. Use when the user wants stronger-than-single-model assurance on a deliverable — phrases like "/duet", "run duet", "consensus loop", "iterate with GPT", "have GPT critique this", "second-opinion this", "two-model review", or "get GPT to score this against the rubric". Works on every Claude surface (web, desktop, mobile chat, cowork) via the duet-bridge connector: YOU (the assistant) play the Opus side and call the GPT bridge for the cross-vendor critique, so no extra API credits are needed beyond your own session.
 metadata:
-  version: 2.1.0
+  version: 2.2.0
   portable: true
 ---
 
@@ -77,11 +77,23 @@ something before it can finish. Resolve it and continue with
 `duet_gpt_resume_turn(session_id, tool_use_id, tool_result)`, and keep resolving
 successive requests until the turn returns `status: "final"`. Branch on
 `payload.tool_name`:
-- **`claude_slash_command`** — GPT asked you to run a slash command (e.g.
-  `/austlii-legal-research`). Run it if you can on this surface and resume with its
-  output; if you cannot (most chat surfaces), resume with a brief note that the tool
-  is unavailable so GPT proceeds with its own analysis. (Do the lookup yourself and
-  fold it into the spec when a task truly depends on verified external facts.)
+- **`claude_slash_command`** — GPT asked you to run a skill. GPT is told it may
+  request: `australian-legal-research` (find/verify Australian cases and
+  legislation, "is this still good law"), `submissions-verification` (verify every
+  citation in a draft), and `submission-drafting` (persuasive-writing review — the
+  args may name a specific stage: `devils-advocate`, `fact-finder`, or
+  `porter-gate`). **Service the request with the matching skill on this surface**
+  (invoke it directly or via a Task subagent) and resume with the output. Take as
+  long as the research needs — the bridge session waits indefinitely (durable
+  state) and the result is bounded server-side so the resumed call stays inside
+  the time window. If the named skill isn't available here, do the closest lookup
+  you can with your own tools and resume with that, saying what you substituted;
+  resume with "unavailable" only as a last resort. (The user's own GPT
+  environments carry the same capabilities natively — `@Submission Drafting` in
+  ChatGPT/Cowork, `$workflow-router`/`$devils-advocate`/`$fact-finder`/
+  `$porter-gate` and `$australian-legal-research` in Codex — duet mirrors them
+  through this round-trip because the bridge GPT is the raw API and cannot see
+  ChatGPT-side skills.)
 - **`request_document`** — GPT wants the actual text of a document (its name is in
   `payload.tool_args.name`, with optional `query`/`source_hint`). Fetch it from the
   co-work vault / project files / uploads, extract text from binary formats, and
@@ -106,6 +118,12 @@ the budget, returns `status:"error"` with `payload.error == "gpt_timeout"` (`ret
   `available_documents` so GPT pulls them. That reliably returns inside the window.
 - Pushed docs are bounded by a cumulative size budget; any over-budget ones are dropped with
   a `[N document(s) omitted …]` marker and can still be pulled via `request_document`.
+- **Long research pauses are safe.** Skill requests from GPT run on YOUR side with no time
+  limit — the suspended bridge session is persisted durably (GCS) and survives server
+  restarts, and oversized results are truncated server-side (with a marker) so the resume
+  call still fits the window. If `duet_gpt_resume_turn` ever returns an `unknown session`
+  error after a very long pause, don't lose the work: restart the candidate's turn with a
+  fresh `duet_gpt_start_turn`, folding the research findings into `history_note`.
 
 ## Fallback flow — one-call `duet_run` (for non-Claude orchestrators)
 
