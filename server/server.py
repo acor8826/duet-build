@@ -612,7 +612,7 @@ if mcp is not None:
     ) -> Dict[str, Any]:
         """Run the FULL two-model consensus loop server-side and return the final artifact.
 
-        One call does the whole thing: Claude Opus 4.8 drafts, GPT-5.6 critiques and
+        One call does the whole thing: Claude Fable 5 drafts, GPT-5.6 critiques and
         scores, Opus revises, repeating until both models accept the same candidate
         (rubric.acceptance_check) or the iteration cap is hit, then an independent
         verifier (fresh context) signs off. Designed so any surface that can reach this

@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional
 from rubric import acceptance_check  # reuse the canonical two-gate acceptance rule
 from jsonutil import _json_obj  # tolerant JSON extraction (shared with server.py)
 
-OPUS_MODEL = os.environ.get("DUET_OPUS_MODEL", "claude-opus-4-8")
+OPUS_MODEL = os.environ.get("DUET_OPUS_MODEL", "claude-fable-5")
 GPT_MODEL = os.environ.get("OPENAI_PARTNER_MODEL", "gpt-5.6")
 DEFAULT_THRESHOLD = int(os.environ.get("DUET_CONFIDENCE_THRESHOLD", "95"))
 DEFAULT_CAP = int(os.environ.get("DUET_ITERATION_CAP", "8"))
@@ -118,25 +118,49 @@ def _render_documents(documents: Optional[List[Dict[str, Any]]]) -> str:
 
 # ---------------------- model calls ----------------------
 
-def _opus_call(system: str, user: str, max_tokens: int = 4096) -> str:
+def _opus_call(system: str, user: str, max_tokens: int = 16000) -> str:
+    """Call the Claude side of the loop via the Anthropic API.
+
+    Default model is claude-fable-5. Fable/Mythos-tier notes: thinking is always
+    on and counts against max_tokens (hence the raised default cap — the old 4096
+    could be consumed by thinking alone), and safety classifiers can decline a
+    request with stop_reason "refusal". For those models we opt into the
+    server-side fallback so a false-positive decline is re-served by
+    claude-opus-4-8 inside the same call.
+    """
     import anthropic
     client = anthropic.Anthropic(
         api_key=os.environ["ANTHROPIC_API_KEY"],
         timeout=OPENAI_TIMEOUT,
         max_retries=OPENAI_MAX_RETRIES,
     )
+    kwargs: Dict[str, Any] = {
+        "model": OPUS_MODEL,
+        "max_tokens": max_tokens,
+        # cache the (reused) system prompt across the loop's Claude turns
+        "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": user}],
+    }
+    fable_tier = OPUS_MODEL.startswith(("claude-fable", "claude-mythos"))
     try:
-        msg = client.messages.create(
-            model=OPUS_MODEL,
-            max_tokens=max_tokens,
-            # cache the (reused) system prompt across the loop's Opus turns
-            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": user}],
-        )
+        if fable_tier:
+            msg = client.beta.messages.create(
+                betas=["server-side-fallback-2026-06-01"],
+                fallbacks=[{"model": "claude-opus-4-8"}],
+                **kwargs,
+            )
+        else:
+            msg = client.messages.create(**kwargs)
     except Exception as e:
         if _is_timeout_error(e):
-            raise DuetTimeout(f"Opus call timed out after ~{OPENAI_TIMEOUT:.0f}s") from e
+            raise DuetTimeout(f"Claude call timed out after ~{OPENAI_TIMEOUT:.0f}s") from e
         raise
+    if getattr(msg, "stop_reason", None) == "refusal":
+        # Whole fallback chain declined (or non-Fable model refused) — surface
+        # cleanly rather than parsing empty content as a WorkProduct.
+        raise RuntimeError(
+            "Claude declined the request (stop_reason=refusal); rephrase the spec and retry."
+        )
     return "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", None) == "text")
 
 
@@ -168,7 +192,7 @@ def _gpt_call(system: str, user: str) -> str:
 # ---------------------- prompts ----------------------
 
 _OPUS_SYSTEM = (
-    "You are Claude Opus 4.8, the lead author in a two-model consensus system called "
+    "You are Claude Fable 5, the lead author in a two-model consensus system called "
     "\"duet\", collaborating with OpenAI GPT-5.6. You draft and iteratively improve a "
     "deliverable until both models independently score the same candidate at or above "
     "{threshold}/100 against the rubric (accuracy, completeness, clarity, rigour, "

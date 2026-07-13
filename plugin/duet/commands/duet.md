@@ -1,5 +1,5 @@
 ---
-description: Two-model consensus — Opus 4.8 drafts, GPT-5.6 critiques via the duet-bridge connector, iterate to consensus, independent verifier signs off.
+description: Two-model consensus — Fable 5 drafts, GPT-5.6 critiques via the duet-bridge connector, iterate to consensus, independent verifier signs off.
 argument-hint: <task / deliverable to bring to two-model consensus>
 ---
 

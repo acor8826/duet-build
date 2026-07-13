@@ -174,7 +174,7 @@ Invoke-Gcloud run deploy $ServiceName `
     --region $Region `
     --project $Project `
     --allow-unauthenticated `
-    --set-env-vars "OPENAI_PARTNER_MODEL=$PartnerModel,DUET_TRANSPORT=http,DUET_STATE_DIR=/tmp/duet-state,DUET_ITERATION_CAP=8,DUET_CONFIDENCE_THRESHOLD=95,DUET_OPUS_MODEL=claude-opus-4-8,DUET_OPENAI_TIMEOUT=150,DUET_MAX_OUTPUT_TOKENS=8000,DUET_GPT_REASONING_EFFORT=medium,DUET_MAX_TOTAL_DOC_CHARS=120000" `
+    --set-env-vars "OPENAI_PARTNER_MODEL=$PartnerModel,DUET_TRANSPORT=http,DUET_STATE_DIR=/tmp/duet-state,DUET_ITERATION_CAP=8,DUET_CONFIDENCE_THRESHOLD=95,DUET_OPUS_MODEL=claude-fable-5,DUET_OPENAI_TIMEOUT=150,DUET_MAX_OUTPUT_TOKENS=8000,DUET_GPT_REASONING_EFFORT=medium,DUET_MAX_TOTAL_DOC_CHARS=120000" `
     --set-secrets $secretMap `
     --memory 512Mi `
     --cpu 1 `
