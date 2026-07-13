@@ -1,5 +1,6 @@
 {
   "name": "duet",
+  "version": "2.1.0",
   "description": "Two-model consensus collaboration between Claude Fable 5 and OpenAI GPT-5.6 via the duet-bridge connector. Provides the /duet slash command (resolves through the command resolver, sidestepping the personal-skill 'Unknown skill' bug) plus an auto-triggering skill for natural-language invocation.",
   "author": {
     "name": "acor8826"

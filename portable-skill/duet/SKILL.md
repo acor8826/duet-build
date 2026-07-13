@@ -2,7 +2,7 @@
 name: duet
 description: Two-model consensus collaboration between Claude Fable 5 and OpenAI GPT-5.6. Use when the user wants stronger-than-single-model assurance on a deliverable — phrases like "/duet", "run duet", "consensus loop", "iterate with GPT", "have GPT critique this", "second-opinion this", "two-model review", or "get GPT to score this against the rubric". Works on every Claude surface (web, desktop, mobile chat, cowork) via the duet-bridge connector: YOU (the assistant) play the Opus side and call the GPT bridge for the cross-vendor critique, so no extra API credits are needed beyond your own session.
 metadata:
-  version: 2.0.0
+  version: 2.1.0
   portable: true
 ---
 
