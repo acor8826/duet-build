@@ -1,7 +1,7 @@
-# duet — Opus 4.8 ↔ GPT-5.6 consensus collaboration
+# duet — Fable 5 ↔ GPT-5.6 consensus collaboration
 
 `duet` is a Claude Code skill plus a Python FastMCP server that drives two-model
-consensus on a deliverable. Claude Opus 4.8 and OpenAI GPT-5.6 take turns
+consensus on a deliverable. Claude Fable 5 and OpenAI GPT-5.6 take turns
 drafting, critiquing, scoring, and counter-drafting against a shared rubric
 until **both** score the same candidate ≥ 95/100 with **zero** open critique
 items. An independent verifier subagent then signs off, and the user accepts
@@ -25,7 +25,7 @@ at gate G3.
 flowchart TB
     user["User: /duet &lt;task&gt;"] -->|enqueue| prd[("duet-prd.json")]
     prd -->|pop| outer["outer-loop.ps1"]
-    outer -->|claude -p /duet:run| skill["duet skill (Opus 4.8)"]
+    outer -->|claude -p /duet:run| skill["duet skill (Fable 5)"]
     skill -->|state machine| sm{{"inner_loop.py"}}
     sm -->|G1 ok| draft["DRAFTING"]
     draft --> roster["ROSTER_PROPOSAL"]
