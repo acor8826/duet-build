@@ -1,6 +1,6 @@
 """FastMCP bridge for the duet skill.
 
-Exposes four tools used by the Claude-side orchestrator to drive a GPT-5.6
+Exposes four tools used by the Claude-side orchestrator to drive a GPT-6 Astra
 conversation that can itself request Claude Code slash commands. The bridge
 implements the suspend-on-tool-call pattern: when GPT emits a function_call,
 the bridge persists session state and returns `{status: "tool_request"}` to the
@@ -9,15 +9,18 @@ and resumes via duet_gpt_resume_turn.
 
 GPT calls go through the OpenAI Responses API (/v1/responses) statelessly:
 `store=False`, the full item history replayed each call, and reasoning items
-(with encrypted_content) preserved in the session history — that is what lets
-gpt-5.6 combine function tools WITH active reasoning, which chat.completions
-refuses (HTTP 400 unless reasoning_effort='none').
+(with encrypted_content) preserved in the session history. Responses is also
+the only surface on which gpt-6-astra supports tool calling at all, and the
+only one that accepts reasoning effort "max"; note that Astra has no "none"
+effort, so the reasoning-off workaround used for the old chat.completions path
+is not available here (nor needed — Responses takes tools + reasoning together).
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -30,13 +33,23 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from state import Session, SessionStore  # noqa: E402
 from rubric import WorkProduct  # noqa: E402
+from apierrors import (  # noqa: E402
+    call_with_backoff,
+    describe,
+    error_summary,
+    is_quota_error,
+    is_rate_limit_error,
+    is_timeout_error,
+    retry_after_seconds,
+    status_of,
+)
 from prompts.system_prompts import PROMPTS  # noqa: E402
 from jsonutil import _json_obj  # noqa: E402  (tolerant final-WorkProduct parsing)
 import duet_run as duet_run_mod  # noqa: E402  (aliased: the MCP tool below is named duet_run)
 
 load_dotenv()
 
-MODEL = os.environ.get("OPENAI_PARTNER_MODEL", "gpt-5.6")
+MODEL = os.environ.get("OPENAI_PARTNER_MODEL", "gpt-6-astra")
 STATE_DIR = os.environ.get("DUET_STATE_DIR", str(Path.home() / ".claude" / "duet"))
 TRANSPORT = os.environ.get("DUET_TRANSPORT", "stdio")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -54,6 +67,14 @@ DUET_MAX_DOC_REQUESTS = int(os.environ.get("DUET_MAX_DOC_REQUESTS", "4"))  # req
 # and a cumulative cap on pushed-document text. All are env-tunable with safe defaults.
 DUET_OPENAI_TIMEOUT = float(os.environ.get("DUET_OPENAI_TIMEOUT", "150"))  # seconds, < 180s client cap
 DUET_OPENAI_MAX_RETRIES = int(os.environ.get("DUET_OPENAI_MAX_RETRIES", "0"))  # SDK retries would multiply wall-clock
+# Blind SDK retries stay off (above), but a 429 THROTTLE is worth a short, budgeted
+# wait: it fails instantly and clears in seconds, whereas failing the whole tool call
+# costs the caller a full round trip. These bound that wait. A per-tool-call deadline
+# keeps the retries inside the client window — a retry is skipped when the sleep plus
+# headroom would push past it — and quota (out-of-credit) errors are never retried.
+DUET_RATE_LIMIT_RETRIES = int(os.environ.get("DUET_RATE_LIMIT_RETRIES", "2"))
+DUET_RATE_LIMIT_BACKOFF = float(os.environ.get("DUET_RATE_LIMIT_BACKOFF", "5"))  # seconds, doubled per retry
+DUET_CALL_BUDGET = float(os.environ.get("DUET_CALL_BUDGET", "165"))  # whole-tool-call budget, < 180s client cap
 # On the Responses API the output cap covers reasoning + visible output together,
 # so the default is higher than the old chat.completions cap (4000): at effort
 # "medium" the reasoning share alone can run to thousands of tokens. Wall-clock is
@@ -67,8 +88,10 @@ DUET_MAX_TOTAL_DOC_CHARS = int(os.environ.get("DUET_MAX_TOTAL_DOC_CHARS", "12000
 # orchestrator-side with no limit; only the text handed back to GPT is bounded.
 DUET_MAX_TOOL_RESULT_CHARS = int(os.environ.get("DUET_MAX_TOOL_RESULT_CHARS", "60000"))
 # Reasoning effort for GPT calls. The Responses API supports tools + reasoning
-# together (the chat.completions combination gpt-5.6 rejects), so reasoning is ON
-# by default again. Set empty to omit the param and take the model default.
+# together, so reasoning is ON by default. gpt-6-astra accepts low/medium/high/xhigh
+# and (Responses only) max; it has NO "none", so effort cannot be switched off on
+# this model — set empty to omit the param and take the model default instead.
+# Raising this raises tokens per call, which is what tips a low usage tier into 429s.
 DUET_GPT_REASONING_EFFORT = os.environ.get("DUET_GPT_REASONING_EFFORT", "medium")
 
 # Below this candidate size the payload is "small" and gets no concise-critique nudge.
@@ -85,21 +108,9 @@ def _openai_client():
     )
 
 
-def _is_timeout_error(exc: Exception) -> bool:
-    """True if exc is an OpenAI timeout / connection error.
-
-    Lets the loop return a clean, retriable signal inside the client window instead of
-    letting the call overrun the ~180s cap. Matches by type when openai is importable,
-    else falls back to the class name so a stubbed client (tests) can signal a timeout.
-    """
-    try:
-        from openai import APITimeoutError, APIConnectionError
-        if isinstance(exc, (APITimeoutError, APIConnectionError)):
-            return True
-    except Exception:  # pragma: no cover - openai always present in practice
-        pass
-    name = type(exc).__name__
-    return "Timeout" in name or "APIConnectionError" in name
+# Timeout classification lives in apierrors alongside the quota/throttle split; the
+# module-local alias keeps the call sites (and their tests) reading as before.
+_is_timeout_error = is_timeout_error
 
 _STORE = SessionStore(STATE_DIR)
 
@@ -310,6 +321,9 @@ def _run_openai_loop(session: Session) -> Dict[str, Any]:
     and its function_call_output to be replayed on the next request.
     """
     client = _openai_client()
+    # One budget for the whole tool call: tool round-trips and any throttle backoff
+    # share it, so neither can walk the handler past the client's ~180s cap.
+    deadline = time.monotonic() + DUET_CALL_BUDGET
     while True:
         if session.doc_requests_made < DUET_MAX_DOC_REQUESTS:
             call_kwargs: Dict[str, Any] = {
@@ -330,14 +344,77 @@ def _run_openai_loop(session: Session) -> Dict[str, Any]:
         if DUET_GPT_REASONING_EFFORT:
             call_kwargs["reasoning"] = {"effort": DUET_GPT_REASONING_EFFORT}
         try:
-            resp = client.responses.create(
-                model=MODEL,
-                input=session.history,
-                store=False,
-                include=["reasoning.encrypted_content"],
-                **call_kwargs,
+            resp = call_with_backoff(
+                lambda: client.responses.create(
+                    model=MODEL,
+                    input=session.history,
+                    store=False,
+                    include=["reasoning.encrypted_content"],
+                    **call_kwargs,
+                ),
+                attempts=DUET_RATE_LIMIT_RETRIES,
+                base_delay=DUET_RATE_LIMIT_BACKOFF,
+                deadline=deadline,
+                log=lambda msg: print(
+                    f"[duet-bridge] session={session.session_id}: {msg}", file=sys.stderr
+                ),
             )
         except Exception as e:
+            if is_quota_error(e):
+                # Terminal billing stop on the OpenAI account the bridge's key belongs
+                # to. Say so precisely — this is the ONE failure a top-up fixes, and
+                # calling every 429 a credit problem is what sends people to a billing
+                # page that already shows a healthy balance.
+                print(
+                    f"[duet-bridge] session={session.session_id}: OpenAI quota/billing "
+                    f"stop ({error_summary(e)}); returning gpt_quota_exhausted.",
+                    file=sys.stderr,
+                )
+                return {
+                    "status": "error",
+                    "payload": {
+                        "error": "gpt_quota_exhausted",
+                        "retriable": False,
+                        "openai": describe(e, "openai"),
+                        "hint": (
+                            "OpenAI refused the call for billing reasons, not throttling. "
+                            "Check the balance of the ORGANISATION AND PROJECT that the "
+                            "bridge's OPENAI_API_KEY belongs to — credit on another org, "
+                            "project or vendor does not apply to this key — and check for "
+                            "a project-level monthly spend cap, which returns the same "
+                            "error with credit still on the account."
+                        ),
+                    },
+                }
+            if is_rate_limit_error(e):
+                # A funded account going too fast for its tier. Retries above are already
+                # spent (or would not fit the window), so hand back a retriable signal
+                # with the vendor's own Retry-After rather than a raw exception.
+                retry_after = retry_after_seconds(e)
+                print(
+                    f"[duet-bridge] session={session.session_id}: OpenAI rate limit "
+                    f"({error_summary(e)}) after {DUET_RATE_LIMIT_RETRIES} retr(ies); "
+                    f"returning gpt_rate_limited.",
+                    file=sys.stderr,
+                )
+                return {
+                    "status": "error",
+                    "payload": {
+                        "error": "gpt_rate_limited",
+                        "retriable": True,
+                        "retry_after_s": retry_after,
+                        "openai": describe(e, "openai"),
+                        "hint": (
+                            "OpenAI throttled the call (a per-minute tier limit, NOT an "
+                            "out-of-credit stop — the account can still spend). Wait "
+                            + (f"~{retry_after:.0f}s" if retry_after else "a few seconds")
+                            + " and retry the same turn, or cut the tokens per call: send "
+                            "fewer/smaller documents, advertise them via "
+                            "available_documents for GPT to pull one at a time, or lower "
+                            "DUET_GPT_REASONING_EFFORT."
+                        ),
+                    },
+                }
             if not _is_timeout_error(e):
                 raise
             # The call outran the time budget. Return a clean, retriable signal INSIDE the
@@ -580,17 +657,62 @@ def _close_session_impl(session_id: str) -> Dict[str, Any]:
     return {"ok": True, "session_id": session_id}
 
 
-def _health_impl() -> Dict[str, Any]:
-    return {
+def _probe_model() -> Dict[str, Any]:
+    """Ask OpenAI whether the configured model is actually reachable on this key.
+
+    A models.retrieve costs no tokens, so it is the cheapest way to separate the
+    three failures that all present as "duet stopped working": the key is billing
+    blocked, the key's org/project has no access to the model yet (a staged rollout
+    like gpt-6-astra answers 404/403 `model_not_found`), or nothing is wrong with
+    the account and the calls are simply being throttled.
+    """
+    try:
+        _openai_client().models.retrieve(MODEL)
+        return {"model_available": True}
+    except Exception as e:  # any failure here is the diagnosis, not a crash
+        probe: Dict[str, Any] = {
+            "model_available": False,
+            "openai": describe(e, "openai"),
+        }
+        if is_quota_error(e):
+            probe["diagnosis"] = (
+                "billing: the OPENAI_API_KEY's organisation/project cannot spend "
+                "(out of credit, or a project spend cap). Only this one is fixed by "
+                "topping up, and only on that org and project."
+            )
+        elif is_rate_limit_error(e):
+            probe["diagnosis"] = (
+                "throttled: the key works and can spend; it is over a per-minute tier "
+                "limit. Retry, or cut tokens per call. NOT a credit problem."
+            )
+        elif status_of(e) in (401, 403, 404):
+            probe["diagnosis"] = (
+                f"access: the key cannot use {MODEL!r} — wrong key, or the org/project "
+                "has no access to this model yet (staged rollouts answer 404/403). "
+                "Set OPENAI_PARTNER_MODEL to a model the key can reach."
+            )
+        else:
+            probe["diagnosis"] = "unclassified — see openai.status/code/detail."
+        return probe
+
+
+def _health_impl(probe: bool = False) -> Dict[str, Any]:
+    out = {
         "ok": True,
         "model": MODEL,
         "gpt_api": "responses",
         "gpt_reasoning_effort": DUET_GPT_REASONING_EFFORT or "(model default)",
+        "rate_limit_retries": DUET_RATE_LIMIT_RETRIES,
+        "rate_limit_backoff_s": DUET_RATE_LIMIT_BACKOFF,
+        "call_budget_s": DUET_CALL_BUDGET,
         "transport": TRANSPORT,
         "state_dir": STATE_DIR,
         "opus_model": duet_run_mod.OPUS_MODEL,
         "duet_run_available": duet_run_mod.opus_available(),
     }
+    if probe:
+        out["probe"] = _probe_model()
+    return out
 
 
 if mcp is not None:
@@ -634,9 +756,15 @@ if mcp is not None:
         return _close_session_impl(session_id)
 
     @mcp.tool()
-    def duet_health() -> Dict[str, Any]:
-        """Health probe — returns model + transport configuration."""
-        return _health_impl()
+    def duet_health(probe: bool = False) -> Dict[str, Any]:
+        """Health probe — returns model + transport configuration.
+
+        Pass probe=True to additionally ask OpenAI whether the configured model is
+        reachable on the bridge's key (a token-free models.retrieve). Use it when duet
+        starts failing: `probe.diagnosis` separates a billing stop from a throttle from
+        the key simply not having access to the model yet.
+        """
+        return _health_impl(probe=probe)
 
     @mcp.tool()
     def duet_run(
@@ -647,7 +775,7 @@ if mcp is not None:
     ) -> Dict[str, Any]:
         """Run the FULL two-model consensus loop server-side and return the final artifact.
 
-        One call does the whole thing: Claude Fable 5 drafts, GPT-5.6 critiques and
+        One call does the whole thing: Claude Fable 5 drafts, GPT-6 Astra critiques and
         scores, Opus revises, repeating until both models accept the same candidate
         (rubric.acceptance_check) or the iteration cap is hit, then an independent
         verifier (fresh context) signs off. Designed so any surface that can reach this

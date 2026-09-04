@@ -1,15 +1,15 @@
 ---
 name: duet
-description: Two-model consensus collaboration between Claude Fable 5 and OpenAI GPT-5.6. Use when the user wants stronger-than-single-model assurance on a deliverable — phrases like "/duet", "run duet", "consensus loop", "iterate with GPT", "have GPT critique this", "second-opinion this", "two-model review", or "get GPT to score this against the rubric". Works on every Claude surface (web, desktop, mobile chat, cowork) via the duet-bridge connector: YOU (the assistant) play the Opus side and call the GPT bridge for the cross-vendor critique, so no extra API credits are needed beyond your own session.
+description: Two-model consensus collaboration between Claude Fable 5 and OpenAI GPT-6 Astra. Use when the user wants stronger-than-single-model assurance on a deliverable — phrases like "/duet", "run duet", "consensus loop", "iterate with GPT", "have GPT critique this", "second-opinion this", "two-model review", or "get GPT to score this against the rubric". Works on every Claude surface (web, desktop, mobile chat, cowork) via the duet-bridge connector: YOU (the assistant) play the Opus side and call the GPT bridge for the cross-vendor critique, so no extra API credits are needed beyond your own session.
 metadata:
-  version: 2.2.0
+  version: 2.3.0
   portable: true
 ---
 
 # duet — portable two-model consensus
 
 This skill gets a deliverable to two-model consensus quality: **Claude Fable 5**
-(you, the assistant running this skill) and **OpenAI GPT-5.6** (reached through the
+(you, the assistant running this skill) and **OpenAI GPT-6 Astra** (reached through the
 duet-bridge connector) draft, critique, score, and counter-draft against a shared
 rubric until both accept the same candidate, after which an independent verifier
 signs off.
@@ -124,6 +124,28 @@ the budget, returns `status:"error"` with `payload.error == "gpt_timeout"` (`ret
   call still fits the window. If `duet_gpt_resume_turn` ever returns an `unknown session`
   error after a very long pause, don't lose the work: restart the candidate's turn with a
   fresh `duet_gpt_start_turn`, folding the research findings into `history_note`.
+
+### When OpenAI refuses the call
+A 429 from OpenAI means one of two unrelated things and the bridge now names which,
+because they call for opposite responses:
+- `payload.error == "gpt_rate_limited"` (`retriable:true`) — a per-minute tier ceiling on
+  an account that can still spend. The bridge has already backed off and retried inside
+  the window. Wait `payload.retry_after_s` (a few seconds if absent) and retry the SAME
+  turn — the session is left clean, so nothing is lost. If it recurs, cut the tokens per
+  call: move documents into `available_documents`, condense the `candidate`, or ask for a
+  concise critique. **This is not a credit problem — do not tell the user to top up.**
+- `payload.error == "gpt_quota_exhausted"` (`retriable:false`) — the bridge's OpenAI key is
+  genuinely blocked on billing. Stop retrying and say so. It is scoped to the organisation
+  AND project the key belongs to: credit on another org, project or vendor (an Anthropic
+  balance, say) does not unblock it, and a project spend cap raises the same error with
+  credit still showing on the account.
+`payload.openai` carries the vendor's status, code and message for both, so quote that
+rather than guessing at the cause.
+
+`duet_health` also takes `probe: true`, which asks OpenAI (token-free) whether the
+configured model is reachable on the bridge's key and returns a `probe.diagnosis`
+separating a billing stop from a throttle from the key not having access to that model
+id yet. Use it before telling the user anything about credit.
 
 ## Fallback flow — one-call `duet_run` (for non-Claude orchestrators)
 

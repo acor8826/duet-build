@@ -30,13 +30,23 @@ start/resume path (`duet_gpt_start_turn` with `request_document`).
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from rubric import acceptance_check  # reuse the canonical two-gate acceptance rule
 from jsonutil import _json_obj  # tolerant JSON extraction (shared with server.py)
+from apierrors import (  # quota vs throttle split + budgeted retry (shared with server.py)
+    call_with_backoff,
+    describe,
+    error_summary,
+    is_quota_error,
+    is_rate_limit_error,
+    is_timeout_error,
+    retry_after_seconds,
+)
 
 OPUS_MODEL = os.environ.get("DUET_OPUS_MODEL", "claude-fable-5")
-GPT_MODEL = os.environ.get("OPENAI_PARTNER_MODEL", "gpt-5.6")
+GPT_MODEL = os.environ.get("OPENAI_PARTNER_MODEL", "gpt-6-astra")
 DEFAULT_THRESHOLD = int(os.environ.get("DUET_CONFIDENCE_THRESHOLD", "95"))
 DEFAULT_CAP = int(os.environ.get("DUET_ITERATION_CAP", "8"))
 MAX_DOC_CHARS = int(os.environ.get("DUET_MAX_DOC_CHARS", "100000"))  # per-document content cap (push)
@@ -51,28 +61,92 @@ OPENAI_MAX_RETRIES = int(os.environ.get("DUET_OPENAI_MAX_RETRIES", "0"))
 # default than the old chat.completions 4000 (see server.py for the rationale).
 MAX_OUTPUT_TOKENS = int(os.environ.get("DUET_MAX_OUTPUT_TOKENS", "8000"))
 GPT_REASONING_EFFORT = os.environ.get("DUET_GPT_REASONING_EFFORT", "medium")  # empty = model default
+# Throttle handling (same knobs as server.py): a 429 rate limit is a transient tier
+# ceiling on a funded account, so it gets a short budgeted backoff; a 429/400 billing
+# stop is terminal and is never retried. See apierrors for the split.
+RATE_LIMIT_RETRIES = int(os.environ.get("DUET_RATE_LIMIT_RETRIES", "2"))
+RATE_LIMIT_BACKOFF = float(os.environ.get("DUET_RATE_LIMIT_BACKOFF", "5"))  # seconds, doubled per retry
+CALL_BUDGET = float(os.environ.get("DUET_CALL_BUDGET", "165"))  # per model call, < 180s client cap
 
 
 class DuetTimeout(Exception):
     """A single model call outran the time budget — surfaced as a retriable error."""
 
 
-def _is_timeout_error(exc: Exception) -> bool:
-    """True for OpenAI/Anthropic timeout / connection errors (match by type, else by name)."""
+class DuetVendorError(Exception):
+    """A vendor refused the call (billing stop or throttle) — carries the error payload.
+
+    `run_duet` returns `payload` to the caller verbatim, so the failure names the
+    vendor, the HTTP status and the vendor's own code rather than surfacing as a
+    bare traceback that any reader would file under "out of credit".
+    """
+
+    def __init__(self, payload: Dict[str, Any]) -> None:
+        super().__init__(payload.get("error", "vendor_error"))
+        self.payload = payload
+
+
+# Timeout classification is shared with the bridge; the local alias keeps call sites short.
+_is_timeout_error = is_timeout_error
+
+
+def _vendor_failure(exc: Exception, vendor: str) -> DuetVendorError:
+    """Build the structured billing-stop / throttle error for a failed model call."""
+    key_env = "OPENAI_API_KEY" if vendor == "openai" else "ANTHROPIC_API_KEY"
+    if is_quota_error(exc):
+        return DuetVendorError({
+            "status": "error",
+            "error": f"{vendor}_quota_exhausted",
+            "retriable": False,
+            "vendor_error": describe(exc, vendor),
+            "hint": (
+                f"{vendor} refused the call for billing reasons, not throttling. Check the "
+                f"balance of the account/organisation AND project that the bridge's "
+                f"{key_env} belongs to — credit on another account, project or vendor does "
+                f"not apply to this key — and check for a project spend cap, which returns "
+                f"the same error with credit still on the balance."
+            ),
+        })
+    retry_after = retry_after_seconds(exc)
+    return DuetVendorError({
+        "status": "error",
+        "error": f"{vendor}_rate_limited",
+        "retriable": True,
+        "retry_after_s": retry_after,
+        "vendor_error": describe(exc, vendor),
+        "hint": (
+            f"{vendor} throttled the call (a per-minute tier limit, NOT an out-of-credit "
+            "stop — the account can still spend). Retry in "
+            + (f"~{retry_after:.0f}s" if retry_after else "a few seconds")
+            + ", or cut the tokens per call: shorter spec, fewer/smaller documents, or a "
+            "lower DUET_GPT_REASONING_EFFORT."
+        ),
+    })
+
+
+def _call_model(fn, vendor: str):
+    """Run one model call with a budgeted throttle retry, mapping vendor errors.
+
+    Timeouts stay `DuetTimeout` (the existing retriable signal); billing stops and
+    exhausted throttles become `DuetVendorError`; anything else propagates.
+    """
     try:
-        from openai import APITimeoutError, APIConnectionError
-        if isinstance(exc, (APITimeoutError, APIConnectionError)):
-            return True
-    except Exception:  # pragma: no cover
-        pass
-    try:
-        import anthropic
-        if isinstance(exc, (anthropic.APITimeoutError, anthropic.APIConnectionError)):
-            return True
-    except Exception:  # pragma: no cover
-        pass
-    name = type(exc).__name__
-    return "Timeout" in name or "APIConnectionError" in name
+        return call_with_backoff(
+            fn,
+            attempts=RATE_LIMIT_RETRIES,
+            base_delay=RATE_LIMIT_BACKOFF,
+            deadline=time.monotonic() + CALL_BUDGET,
+            log=lambda msg: print(f"[duet-run] {vendor}: {msg}"),
+        )
+    except Exception as e:
+        if _is_timeout_error(e):
+            raise DuetTimeout(
+                f"{vendor} call timed out after ~{OPENAI_TIMEOUT:.0f}s"
+            ) from e
+        if is_quota_error(e) or is_rate_limit_error(e):
+            print(f"[duet-run] {vendor} call refused ({error_summary(e)})")
+            raise _vendor_failure(e, vendor) from e
+        raise
 
 
 def opus_available() -> bool:
@@ -142,19 +216,17 @@ def _opus_call(system: str, user: str, max_tokens: int = 16000) -> str:
         "messages": [{"role": "user", "content": user}],
     }
     fable_tier = OPUS_MODEL.startswith(("claude-fable", "claude-mythos"))
-    try:
+
+    def _create():
         if fable_tier:
-            msg = client.beta.messages.create(
+            return client.beta.messages.create(
                 betas=["server-side-fallback-2026-06-01"],
                 fallbacks=[{"model": "claude-opus-4-8"}],
                 **kwargs,
             )
-        else:
-            msg = client.messages.create(**kwargs)
-    except Exception as e:
-        if _is_timeout_error(e):
-            raise DuetTimeout(f"Claude call timed out after ~{OPENAI_TIMEOUT:.0f}s") from e
-        raise
+        return client.messages.create(**kwargs)
+
+    msg = _call_model(_create, "anthropic")
     if getattr(msg, "stop_reason", None) == "refusal":
         # Whole fallback chain declined (or non-Fable model refused) — surface
         # cleanly rather than parsing empty content as a WorkProduct.
@@ -172,8 +244,8 @@ def _gpt_call(system: str, user: str) -> str:
         max_retries=OPENAI_MAX_RETRIES,
     )
     call_kwargs = {"reasoning": {"effort": GPT_REASONING_EFFORT}} if GPT_REASONING_EFFORT else {}
-    try:
-        resp = client.responses.create(
+    resp = _call_model(
+        lambda: client.responses.create(
             model=GPT_MODEL,
             instructions=system,
             input=user,
@@ -181,11 +253,9 @@ def _gpt_call(system: str, user: str) -> str:
             text={"format": {"type": "json_object"}},
             max_output_tokens=MAX_OUTPUT_TOKENS,
             **call_kwargs,
-        )
-    except Exception as e:
-        if _is_timeout_error(e):
-            raise DuetTimeout(f"GPT call timed out after ~{OPENAI_TIMEOUT:.0f}s") from e
-        raise
+        ),
+        "openai",
+    )
     return resp.output_text or "{}"
 
 
@@ -193,7 +263,7 @@ def _gpt_call(system: str, user: str) -> str:
 
 _OPUS_SYSTEM = (
     "You are Claude Fable 5, the lead author in a two-model consensus system called "
-    "\"duet\", collaborating with OpenAI GPT-5.6. You draft and iteratively improve a "
+    "\"duet\", collaborating with OpenAI GPT-6 Astra. You draft and iteratively improve a "
     "deliverable until both models independently score the same candidate at or above "
     "{threshold}/100 against the rubric (accuracy, completeness, clarity, rigour, "
     "fitness-for-purpose). Be rigorous and genuinely self-critical — do not inflate your "
@@ -230,7 +300,7 @@ def _revise_user(spec: str, candidate: str, cand_id: str, gpt_score: int,
         f"SPEC:\n{spec}\n\n"
         f"{docs_block}"
         f"CURRENT CANDIDATE ({cand_id}):\n{candidate}\n\n"
-        f"GPT-5.6 scored this candidate {gpt_score}/100 and raised these critique items:\n{items}\n\n"
+        f"GPT-6 Astra scored this candidate {gpt_score}/100 and raised these critique items:\n{items}\n\n"
         "Revise the artifact to resolve EVERY blocker/major/moderate item (minor/nit are optional). "
         "Do not regress on points already correct. Return JSON exactly:\n"
         f'{{"candidate_id":"cand-{next_n}","candidate_text":"<the full revised artifact>",'
@@ -276,11 +346,15 @@ def run_duet(spec: str, threshold: Optional[int] = None,
 
     Thin wrapper over `_run_duet_inner`: if any single Opus/GPT call outruns the time
     budget (`DuetTimeout`), return a clean, retriable error instead of hanging past the
-    client's ~180s tool-call cap.
+    client's ~180s tool-call cap. A vendor refusal (`DuetVendorError` — billing stop or
+    an exhausted throttle) comes back as its own structured payload, so the caller can
+    tell "this account is out of credit" from "this account is going too fast".
     """
     try:
         return _run_duet_inner(spec, threshold=threshold,
                                iteration_cap=iteration_cap, documents=documents)
+    except DuetVendorError as e:
+        return e.payload
     except DuetTimeout as e:
         return {
             "status": "error",

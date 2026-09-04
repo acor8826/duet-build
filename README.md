@@ -1,7 +1,7 @@
-# duet — Fable 5 ↔ GPT-5.6 consensus collaboration
+# duet — Fable 5 ↔ GPT-6 Astra consensus collaboration
 
 `duet` is a Claude Code skill plus a Python FastMCP server that drives two-model
-consensus on a deliverable. Claude Fable 5 and OpenAI GPT-5.6 take turns
+consensus on a deliverable. Claude Fable 5 and OpenAI GPT-6 Astra take turns
 drafting, critiquing, scoring, and counter-drafting against a shared rubric
 until **both** score the same candidate ≥ 95/100 with **zero** open critique
 items. An independent verifier subagent then signs off, and the user accepts
@@ -32,7 +32,7 @@ flowchart TB
     roster -->|G2 wait| user2["User approves roster"]
     user2 -->|approved| iter["ITERATE (1..cap)"]
     iter -->|tool req| bridge["FastMCP duet-bridge"]
-    bridge -->|responses API| gpt["GPT-5.6"]
+    bridge -->|responses API| gpt["GPT-6 Astra"]
     gpt -->|tool_call| bridge
     bridge -->|suspend| skill
     skill -->|Task /austlii-...| sub["Claude subagent"]
@@ -68,13 +68,14 @@ C:\Users\acor8\OneDrive\Desktop\Connectors\duet-build\
     ├── server.py                     FastMCP bridge (stdio | http)
     ├── state.py                      atomic session store
     ├── rubric.py                     Pydantic models + convergence_check
+    ├── apierrors.py                  429 split: billing stop vs tier throttle + backoff
     ├── prompts\system_prompts.py     per-role GPT system prompts
     ├── requirements.txt
     ├── .env.example
     ├── Dockerfile                    Cloud Run image
     ├── .gcloudignore
     ├── deploy.ps1                    one-shot deploy to australia-southeast1
-    └── tests\                        test_state, test_suspend_resume
+    └── tests\                        test_state, test_suspend_resume, test_rate_limit
 ```
 
 ## Install (Windows host)
@@ -227,11 +228,19 @@ Custom connectors require a Pro / Team / Enterprise account.
 Expected JSON (roughly):
 
 ```json
-{"model": "gpt-5.6", "transport": "http", "state_dir": "/tmp/duet-state", "ok": true}
+{"model": "gpt-6-astra", "transport": "http", "state_dir": "/tmp/duet-state", "ok": true}
 ```
 
 That confirms TLS, ingress, bearer middleware, FastMCP routing, and tool
 registration.
+
+When duet stops working, call it with `probe: true`. That adds a token-free
+`models.retrieve` against the configured model and returns a `probe.diagnosis`
+naming which of the three lookalike failures you have — `billing:` (the key's
+org/project genuinely cannot spend), `throttled:` (the key is fine, it is over a
+per-minute tier limit) or `access:` (the key has no access to that model id yet,
+which is what a staged rollout answers). It is the fastest way to avoid topping
+up an account that was never the problem.
 
 ### Known limitation
 
@@ -268,14 +277,17 @@ connector — no need to remove and re-add).
 |-----------------------------|----------------------------------------------|----------------------------------------------------------|
 | `OPENAI_API_KEY`            | (none, required)                             | OpenAI auth — read at bridge boot.                       |
 | `DUET_MCP_BEARER`           | (none; required when `DUET_TRANSPORT=http`)  | Static bearer token gating the public Cloud Run endpoint. |
-| `OPENAI_PARTNER_MODEL`      | `gpt-5.6`                                    | Model id passed to the Responses API.                    |
+| `OPENAI_PARTNER_MODEL`      | `gpt-6-astra`                                | Model id passed to the Responses API. Tool calling and reasoning effort `max` are Responses-only on this model. |
 | `DUET_ITERATION_CAP`        | `8`                                          | Max inner-loop iterations before ESCALATED.              |
 | `DUET_CONFIDENCE_THRESHOLD` | `95`                                         | Min score (both models) required to converge.            |
 | `DUET_MAX_DOC_CHARS`        | `100000`                                     | Per-document content cap (push + pull); longer text is truncated and marked. |
 | `DUET_MAX_DOC_REQUESTS`     | `4`                                          | Max `request_document` pulls GPT may make per turn before the bridge forces a final. |
 | `DUET_MAX_TOOL_RESULT_CHARS` | `60000`                                     | Cap on one orchestrator-provided tool result (skill output / fetched doc) so the resume call stays inside the client window. JSON-aware truncation with a marker. |
 | `DUET_STATE_GCS_BUCKET`     | (unset; deploy sets `<project>-duet-state`)  | Durable session tier: suspended GPT turns survive instance recycling during long orchestrator-side research pauses. |
-| `DUET_GPT_REASONING_EFFORT` | `medium`                                     | GPT reasoning effort. The Responses API supports tools + reasoning together, so reasoning is on by default. Empty = model default. |
+| `DUET_GPT_REASONING_EFFORT` | `medium`                                     | GPT reasoning effort — `low`/`medium`/`high`/`xhigh`/`max` on `gpt-6-astra` (it has no `none`). The Responses API supports tools + reasoning together, so reasoning is on by default. Empty = model default. Raising it raises tokens per call, which is what tips a low usage tier into 429s. |
+| `DUET_RATE_LIMIT_RETRIES`   | `2`                                          | Budgeted retries for a **transient** 429 (per-minute tier throttle). A billing stop is never retried. |
+| `DUET_RATE_LIMIT_BACKOFF`   | `5`                                          | Seconds before the first throttle retry, doubled each retry, capped at 30s. The vendor's `Retry-After` wins when it sends one. |
+| `DUET_CALL_BUDGET`          | `165`                                        | Whole-tool-call wall-clock budget (< the ~180s client cap). A throttle retry is skipped rather than allowed to push past it. |
 | `DUET_TRANSPORT`            | `stdio`                                      | `stdio` (local MCP) or `http` (Cloud Run).               |
 | `DUET_STATE_DIR`            | `C:\Users\acor8\.claude\duet` / `/tmp/duet-state` | Session + lock directory.                          |
 | `PORT`                      | `8080`                                       | HTTP port (Cloud Run only).                              |
@@ -393,6 +405,24 @@ retriable error instead of hanging:
          smaller documents, or advertise them via available_documents and let GPT pull …"}}
 ```
 
+**Rate limits are not a credit problem.** Both vendors answer **429** for two unrelated
+conditions, and reading every 429 as "out of credit" sends you to a billing page that
+already shows a healthy balance. The bridge classifies them from the vendor's own error
+code (`server/apierrors.py`) and reports each as itself:
+
+| Condition | Vendor signal | Bridge response |
+|---|---|---|
+| **Throttle** — a per-minute tier ceiling on an account that can still spend | OpenAI 429 `rate_limit_exceeded`; Anthropic 429 `rate_limit_error` / 529 `overloaded_error` | Backs off and retries inside the call budget (`DUET_RATE_LIMIT_RETRIES`, honouring `Retry-After`), then returns retriable `gpt_rate_limited` with `retry_after_s`. The session is left clean, so the same turn can just be retried. |
+| **Billing stop** — the account genuinely cannot spend | OpenAI 429 `insufficient_quota` / `billing_hard_limit_reached`; Anthropic 400 `invalid_request_error` "credit balance is too low" | **Never retried.** Returns non-retriable `gpt_quota_exhausted` (`{vendor}_quota_exhausted` from `duet_run`) with the vendor's status, code and message. |
+
+Only the second warrants a top-up, and it is scoped to the **organisation and project the
+bridge's key belongs to** — credit on another org, project or vendor does not unblock that
+key, and a project-level spend cap raises the same error with credit still on the balance.
+When the throttle is what keeps firing, cut tokens per call rather than topping up: prefer
+PULL over PUSH (below), condense the candidate, or lower `DUET_GPT_REASONING_EFFORT`. A new
+model on a low usage tier is the common trigger — `gpt-6-astra` has no free tier and its
+limits are tier-scoped.
+
 **Guidance for large/many documents:** prefer **PULL** (`available_documents` +
 `request_document`) over a big PUSH. Pull splits the work into several short calls — each its
 own tool round-trip inside the window — whereas a single large PUSH critiques everything in
@@ -439,8 +469,10 @@ scores ≥ 95; state lands at `G3_WAIT`; user acceptance moves it to `DONE`.
 
 ### Actual transcript — 2026-05-26, job `job-45206ef47a`
 
-> **Degraded-mode caveat:** OpenAI returned 429 (account quota exhausted) on
-> every model id during this verification run. The GPT-5.5 partner role was
+> **Degraded-mode caveat:** OpenAI returned 429 on every model id during this
+> verification run, recorded at the time as account quota exhaustion (the bridge
+> could not then tell a billing stop from a tier throttle — see "Rate limits are
+> not a credit problem" above, which now makes that distinction explicit). The GPT-5.5 partner role was
 > therefore substituted with **isolated fresh-context Claude subagents**
 > (spawned via the `Agent` tool, `general-purpose` type), each given the
 > verbatim `critic` system prompt from `prompts/system_prompts.py`. This
