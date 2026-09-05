@@ -26,14 +26,14 @@
     Defaults to duet-bridge.
 
 .PARAMETER PartnerModel
-    Defaults to gpt-5.6.
+    Defaults to gpt-6-astra.
 #>
 [CmdletBinding()]
 param(
     [string]$Project      = 'asc-router',
     [string]$Region       = 'australia-southeast1',
     [string]$ServiceName  = 'duet-bridge',
-    [string]$PartnerModel = 'gpt-5.6'
+    [string]$PartnerModel = 'gpt-6-astra'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -199,7 +199,7 @@ Invoke-Gcloud run deploy $ServiceName `
     --region $Region `
     --project $Project `
     --allow-unauthenticated `
-    --set-env-vars "OPENAI_PARTNER_MODEL=$PartnerModel,DUET_TRANSPORT=http,DUET_STATE_DIR=/tmp/duet-state,DUET_STATE_GCS_BUCKET=$stateBucket,DUET_ITERATION_CAP=8,DUET_CONFIDENCE_THRESHOLD=95,DUET_OPUS_MODEL=claude-fable-5,DUET_OPENAI_TIMEOUT=150,DUET_MAX_OUTPUT_TOKENS=8000,DUET_GPT_REASONING_EFFORT=medium,DUET_MAX_TOTAL_DOC_CHARS=120000,DUET_MAX_TOOL_RESULT_CHARS=60000" `
+    --set-env-vars "OPENAI_PARTNER_MODEL=$PartnerModel,DUET_TRANSPORT=http,DUET_STATE_DIR=/tmp/duet-state,DUET_STATE_GCS_BUCKET=$stateBucket,DUET_ITERATION_CAP=8,DUET_CONFIDENCE_THRESHOLD=95,DUET_OPUS_MODEL=claude-fable-5,DUET_OPENAI_TIMEOUT=150,DUET_MAX_OUTPUT_TOKENS=8000,DUET_GPT_REASONING_EFFORT=medium,DUET_MAX_TOTAL_DOC_CHARS=120000,DUET_MAX_TOOL_RESULT_CHARS=60000,DUET_RATE_LIMIT_RETRIES=2,DUET_RATE_LIMIT_BACKOFF=5,DUET_CALL_BUDGET=165" `
     --set-secrets $secretMap `
     --memory 512Mi `
     --cpu 1 `
